@@ -1,13 +1,25 @@
-# HPWater
+### Controls (Demo) / 操作指南
+The demo scene features an **Advanced Camera Controller**.
+Demo 场景内置了 **相机控制器**，操作方式如下：
 
-**Have a question?** [Start a Discussion](../../discussions)
+| Key / 按键 | Function / 功能 |
+| :--- | :--- |
+| **W / S / A / D** | Move Camera<br>前后左右移动 |
+| **Q / E** | Move Up / Down<br>垂直升降 |
+| **Shift** | **Sprint / Boost**<br>**加速移动** |
+| **Scroll Wheel** | Fast Zoom<br>滚轮快速移动 |
+| **Tab** | Unlock Cursor<br>切换鼠标模式 |
+| **Right Mouse** | **Rotate View**<br>**按住右键 旋转视角** |
+| **Left Mouse** | **Interactive Waves**<br>**按住左键 拖动交互** |
+---
+# HPWater
 
 **HP Water Rendering System for Unity HDRP**
 *(基于 Unity HDRP 的HP水体渲染系统)*
 
----
-
 ## 🇬🇧 English
+
+**Have a question?** [Start a Discussion](../../discussions)
 
 > ⚠️ **IMPORTANT NOTE**
 >
