@@ -17,7 +17,7 @@
 If you want to test the interactive water simulation, please download the playable demo from the **[Releases](../../releases)** page.
 
 ### 🔍 Source Code Preview
-programmers are welcome to explore the core implementation details in the [`HanPiWater`](./HanPiWater) folder:
+programmers are welcome to explore the core implementation details in the [`HanPiWater`](./Core_Source_Preview/HanPiWater) folder:
 
 * **Rendering Pipeline & GBuffer:** `HanPiWater/GBuffer`
     * **Deep Integration with HDRP RenderGraph:** Manages custom passes for efficient water rendering.
@@ -65,7 +65,7 @@ This project is licensed under the **Mozilla Public License 2.0 (MPL 2.0)**.
 如果您希望测试水体交互的实际运行效果，请前往 **[Releases (发布页)](../../releases)** 下载最新版本的演示包。
 
 ### 🔍 核心源码预览
-欢迎开发者在 [`HanPiWater`](./HanPiWater) 文件夹中查阅以下核心实现的细节：
+欢迎开发者在 [`HanPiWater`](./Core_Source_Preview/HanPiWater) 文件夹中查阅以下核心实现的细节：
 
 * **渲染管线与 GBuffer (Rendering Pipeline & GBuffer):** `HanPiWater/GBuffer`
     * **HDRP RenderGraph 深度集成:** 管理自定义的水体渲染 Pass。
