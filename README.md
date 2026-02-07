@@ -1,5 +1,7 @@
 # HPWater
 
+**Have a question?** [Start a Discussion](../../discussions)
+
 **HP Water Rendering System for Unity HDRP**
 *(基于 Unity HDRP 的HP水体渲染系统)*
 
@@ -52,6 +54,8 @@ programmers are welcome to explore the core implementation details in the [`HanP
 This project is licensed under the **Mozilla Public License 2.0 (MPL 2.0)**.
 
 ---
+
+**Have a question?** [Start a Discussion](../../discussions)
 
 ## 🇨🇳 中文
 
