@@ -1,0 +1,510 @@
+#pragma kernel CausticCaculateKernel
+#pragma kernel AtrousDenoiseFirst_Single
+
+
+/* #pragma enable_d3d11_debug_symbols
+#pragma use_dxc         
+#pragma target 6.0 */
+
+#pragma multi_compile _ _USE_RGB_CAUSTIC_ON
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Texture.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/ShaderLibrary/ShaderVariables.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/NormalBuffer.hlsl"
+
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/HPWaterCommon.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/HPWaterGlobalShaderVariable.cs.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/Caustic/HPWaterCaustic.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/Caustic/HPWaterCausticPass.cs.hlsl"
+
+//#define DEBUGMODE_ON
+#define DIGITS_OFFSET_R 1e4
+#define DIGITS_OFFSET_L 1e-4
+
+#define GROUP_SIZE_X 16 // 线程组 X 维度大小，需要和下面的 numthreads 匹配
+#define GROUP_SIZE_Y 16 // 线程组 Y 维度大小
+
+#define GET_SCREEN_UV(id,rtSize) ((id.xy + 0.5) * rcp(float2(rtSize, rtSize)))
+
+// ========================================
+// 纹理声明：区分读写状态以优化性能
+// ========================================
+
+// 焦散累积纹理 - 写入（CausticCaculateKernel, GaussianBlurHorizontal）
+RWTexture2D<uint> _causticIrradianceRT_R;
+RWTexture2D<uint> _causticIrradianceRT_G;
+RWTexture2D<uint> _causticIrradianceRT_B;
+
+// 焦散累积纹理 - 只读（PackToFloat4, GaussianBlurVertical）
+Texture2D<uint> _causticIrradianceRT_R_Read;
+Texture2D<uint> _causticIrradianceRT_G_Read;
+Texture2D<uint> _causticIrradianceRT_B_Read;
+
+RWTexture2D<float> _causticRT_Color_FLOAT;
+
+Texture2D<float4> _WaterGbuffer0Atlas;//法线纹理,全分辨率
+Texture2D<float2> _WaterGbuffer1Atlas;//吸收/散射纹理,低分辨率
+Texture2D<float> _WaterCascadeDepth0Atlas;//全分辨率深度纹理
+Texture2D<float> _WaterCascadeDepth1Atlas;//低分辨率深度纹理,用于Nearest-Depth Upsampling（最近深度上采样）
+Texture2D<float> _ShadowDepthCascadeAtlas;//阴影深度纹理,全分辨率
+
+float3 GetNormalizedDeviceCoordinates(float3 worldPos, float4x4 vpMatrix)
+{
+    float4 positionCS = ComputeClipSpacePosition(worldPos, vpMatrix);
+    positionCS *= rcp(positionCS.w);
+    positionCS.xy = positionCS.xy * 0.5 + 0.5;
+    return positionCS.xyz;
+}
+
+// 辅助函数：本地UV转换到图集UV
+float2 LocalToAtlasUV(float2 localUV, uint cascadeIdx)
+{
+    [flatten]
+    if (_CascadeCount == 1)
+        return localUV;
+    else if (_CascadeCount == 2)
+        return float2(localUV.x * 0.5 + cascadeIdx * 0.5, localUV.y);
+    else
+        return localUV * 0.5 + float2(cascadeIdx % 2, cascadeIdx / 2) * 0.5;
+}
+
+float Weight(float diff, float sigma)
+{
+    // 经典的钟形曲线：差异越大，返回值呈指数级归零
+    return exp(-(diff * diff) / (2.0 * sigma * sigma));
+}
+
+
+[numthreads(GROUP_SIZE_X,GROUP_SIZE_Y,1)]
+void CausticCaculateKernel (uint3 id : SV_DispatchThreadID)
+{
+    uint rtSizeX;//一定是正方形
+    float4 debugColor = 1;
+
+    _causticIrradianceRT_G.GetDimensions(rtSizeX,rtSizeX);
+    [branch]
+    if(id.x > rtSizeX || id.y > rtSizeX)return;
+    float2 uvTemp = GET_SCREEN_UV(id, rtSizeX);
+    
+    // 用 UV 转换为各个纹理的采样坐标
+    uint atlasSizeX;
+    _WaterCascadeDepth0Atlas.GetDimensions(atlasSizeX, atlasSizeX);
+    int2 waterCoord = int2(uvTemp * float2(atlasSizeX, atlasSizeX));
+
+    _WaterGbuffer0Atlas.GetDimensions(atlasSizeX, atlasSizeX);
+    int2 normalCoord = int2(uvTemp * float2(atlasSizeX, atlasSizeX));
+
+    _ShadowDepthCascadeAtlas.GetDimensions(atlasSizeX, atlasSizeX);
+    int2 shadowAtlasUV = int2(uvTemp * float2(atlasSizeX, atlasSizeX));
+    
+
+    //采样深度图和法线GBuffer数据
+    //大概率能Return，最先检查    
+    float waterDepth = _WaterCascadeDepth0Atlas.Load(int3(waterCoord, 0)).r;    
+    [branch]
+    if(waterDepth == 0)return;
+    //中概率能Return，紧接着检查
+    float shadowDepth = _ShadowDepthCascadeAtlas.Load(int3(shadowAtlasUV, 0)).r;
+    [branch]
+    if(shadowDepth == 0)return;
+
+    float4 normalData = _WaterGbuffer0Atlas.Load(int3(normalCoord, 0));
+    
+    //解码法线数据
+    NormalData normalDataDecode;
+    DecodeFromNormalBuffer(normalData, normalDataDecode);
+    float3 worldNormal = normalDataDecode.normalWS * float3(_RefractionStrength,1,_RefractionStrength);
+    worldNormal = safeNormalize(worldNormal);
+
+    // ========================================
+    // 级联检测 - 与HDRP原生阴影布局一致
+    // 
+    // HDRP的阴影图集布局规则：
+    // - cascadeCount > 1 时 X轴翻倍 (2列)
+    // - cascadeCount > 2 时 Y轴翻倍 (2行)
+    // 
+    // 1个级联: 整个图集
+    // [0]
+    // 
+    // 2个级联: 左右排列
+    // [0][1]
+    // 
+    // 3-4个级联: 2x2网格
+    // [0][1]
+    // [2][3]
+    // ========================================
+    
+    int cascadeIndex;
+    float2 localUV;
+    uvTemp = GET_SCREEN_UV(id, rtSizeX);
+    
+    [flatten]
+    if (_CascadeCount == 1)
+    {
+        // 1个级联：整个图集
+        cascadeIndex = 0;
+        localUV = uvTemp;
+    }
+    else if (_CascadeCount == 2)
+    {
+        // 2个级联：左右排列
+        cascadeIndex = uvTemp.x >= 0.5 ? 1 : 0;
+        // 局部UV: X乘2取小数，Y不变
+        localUV = float2(frac(uvTemp.x * 2.0), uvTemp.y);
+    }
+    else
+    {
+        // 3-4个级联：2x2网格
+        int cascadeX = uvTemp.x >= 0.5 ? 1 : 0;
+        int cascadeY = uvTemp.y >= 0.5 ? 1 : 0;
+        cascadeIndex = cascadeY * 2 + cascadeX;
+        // 局部UV: XY都乘2取小数
+        localUV = frac(uvTemp * 2.0);
+    }
+    
+    // 使用对应级联的VP逆矩阵重建世界坐标
+    float3 waterSurfacePos = ScreenToWorldPositionOrthographic(localUV, waterDepth, _WaterCascadeAtlasVPInverse[cascadeIndex]);
+    float3 sceneWorldPos = ScreenToWorldPositionOrthographic(localUV, shadowDepth, _WaterCascadeAtlasVPInverse[cascadeIndex]);
+
+#if !defined(DEBUGMODE_ON)    
+    if(sceneWorldPos.y > waterSurfacePos.y)
+    {
+        return;
+    }
+#endif
+    
+    //准备折射数据
+    static const float eta = 1.0 / 1.33;
+    // 使用实际的主光源方向（HDRP定向光）
+    float3 LightDir = normalize(_MainLightDirection.xyz);  // 从 Vector4 获取 xyz
+    
+#if defined(_USE_RGB_CAUSTIC_ON)
+    float3 refractedDir_R = refract(LightDir, worldNormal, eta + _DispersionStrength);
+    float3 refractedDir_G = refract(LightDir, worldNormal, eta);
+    float3 refractedDir_B = refract(LightDir, worldNormal, eta - _DispersionStrength); 
+    // 如果水面的mesh不是平面，也会当作平面来计算，如果不能接受，只能在gbuffer存储几何法线来替换float3(0,1,0)  
+    float3 refractedDir_Fix = refract(LightDir, float3(0,1,0), eta);
+    refractedDir_R -= refractedDir_Fix;
+    refractedDir_R += LightDir;
+    refractedDir_G -= refractedDir_Fix;
+    refractedDir_G += LightDir;
+    refractedDir_B -= refractedDir_Fix;
+    refractedDir_B += LightDir;
+
+    float3 refractedWorldPos_R = 0;   
+    float3 refractedWorldPos_B = 0;
+    
+    // 检查是否发生全反射
+    [branch]
+    if (length(refractedDir_R) == 0 || length(refractedDir_G) == 0 || length(refractedDir_B) == 0) return;
+#else
+    float3 refractedDir_G = refract(LightDir, worldNormal, eta);
+    // 如果水面的mesh不是平面，也会当作平面来计算，如果不能接受，只能在gbuffer存储几何法线来替换float3(0,1,0)
+    float3 refractedDir_Fix = refract(LightDir, float3(0,1,0), eta);
+    refractedDir_G -= refractedDir_Fix;
+    refractedDir_G += LightDir;
+    // 检查是否发生全反射
+    [branch]
+    if (length(refractedDir_G) == 0) return;
+#endif
+
+    // ========================================
+    // 光线步进
+    // ========================================
+#define COARSE_STEPS 16           // 粗步进次数
+
+    float3 rayStart = waterSurfacePos;
+
+    //R2Dither用于随机采样
+    float causticCrossDistance = _CrossDistance * 0.5;
+    float R2Dither = R2_dither(GET_SCREEN_UV(id, rtSizeX) * float2(rtSizeX, rtSizeX), 0);    
+    float coarseStep = causticCrossDistance / COARSE_STEPS;
+    float hitInterval_hi = 0;    
+    float4x4 activeVP = _WaterCascadeAtlasVP[cascadeIndex];
+
+    // 在循环前计算NDC空间的总距离
+    float3 startNDC = GetNormalizedDeviceCoordinates(rayStart, activeVP);
+    float3 endPos = rayStart + refractedDir_G * causticCrossDistance;  // 使用完整距离
+    float3 endNDC = GetNormalizedDeviceCoordinates(endPos, activeVP);
+    float3 ndcDir = endNDC - startNDC;
+
+    bool foundHit = false;
+    float2 hitNDC = 0;
+
+    uint atlasSizeXTemp;//用于隔离变量生命周期，腾出寄存器
+    _ShadowDepthCascadeAtlas.GetDimensions(atlasSizeXTemp, atlasSizeXTemp);
+    
+    // ========================================
+    // 寻找光线击中表面的区间
+    // ========================================
+    // 预计算指数步进
+    float expFactor = ADAPTIVE_EXP_FACTOR_STATIC(causticCrossDistance,CAUSTIC_REFERENCE_DISTANCE);
+    float rcpCount = rcp(float(COARSE_STEPS));
+    float kDenom = rcp(expFactor - 1.0);
+    float kDD = log2(expFactor) * rcpCount * kDenom;
+
+    // 预计算步进乘数：exp(ln(EXP_FACTOR) / N) -> EXP_FACTOR^(1/N)
+    float expStep = pow(expFactor, rcpCount);
+
+    // 计算起始点的 exp 值：expFactor^(Dither/N)
+    float currentExp = pow(expFactor, R2Dither * rcpCount);
+    
+    [loop]
+    for (int i = 0; i <= COARSE_STEPS; i++)
+    {
+        float d = (currentExp - 1.0) * kDenom;
+        float tNDC = d;
+        float3 sampleNDC_G = startNDC + ndcDir * tNDC;
+        
+        // 检查是否在有效范围内
+        if (any(sampleNDC_G.xy < 0) || any(sampleNDC_G.xy > 1)) break;
+        
+        float2 atlasUV = LocalToAtlasUV(sampleNDC_G.xy, cascadeIndex);
+        float sceneDepth = _ShadowDepthCascadeAtlas.Load(int3(int2(atlasUV * float2(atlasSizeXTemp, atlasSizeXTemp)), 0)).r;
+        float rayDepth = sampleNDC_G.z;
+
+        currentExp *= expStep;
+        
+        // 光线在表面附近的薄层内（使用较大容差）
+        if (rayDepth < sceneDepth && tNDC < 1)
+        {
+            // 找到粗略击中位置，记录区间用于细化
+            hitInterval_hi = tNDC * causticCrossDistance;
+            foundHit = true;
+            hitNDC = atlasUV.xy;
+            break;
+        }
+    }
+
+#if !defined(DEBUGMODE_ON)
+    // 如果没有击中，直接返回，避免写入无效数据
+    [branch]
+    if (!foundHit)return;
+#endif
+    
+#if defined(_USE_RGB_CAUSTIC_ON)
+    refractedWorldPos_R = rayStart + refractedDir_R * hitInterval_hi;
+    refractedWorldPos_B = rayStart + refractedDir_B * hitInterval_hi;
+    float2 ndc_R_local = GetNormalizedDeviceCoordinates(refractedWorldPos_R, _WaterCascadeAtlasVP[cascadeIndex]).xy;
+    float2 ndc_B_local = GetNormalizedDeviceCoordinates(refractedWorldPos_B, _WaterCascadeAtlasVP[cascadeIndex]).xy;
+    float2 ndc_R, ndc_B;
+#endif
+    
+    float2 ndc_G = hitNDC;
+#if defined(_USE_RGB_CAUSTIC_ON)
+    ndc_R = LocalToAtlasUV(ndc_R_local, cascadeIndex);
+    ndc_B = LocalToAtlasUV(ndc_B_local, cascadeIndex);
+#endif
+    uint intensityValue = (uint)(_CausticIntensity * DIGITS_OFFSET_R * 1);
+
+#if defined(DEBUGMODE_ON)
+    #if defined(_USE_RGB_CAUSTIC_ON)
+        _causticIrradianceRT_R[id.xy] = intensityValue;
+        _causticIrradianceRT_G[id.xy] = intensityValue;
+        _causticIrradianceRT_B[id.xy] = intensityValue;
+    #else
+        _causticIrradianceRT_G[id.xy] = intensityValue;
+    #endif
+#else
+    #if defined(_USE_RGB_CAUSTIC_ON)
+        float2 FinalUV_R = ndc_R * float2(rtSizeX, rtSizeX);
+        float2 FinalUV_G = ndc_G * float2(rtSizeX, rtSizeX);
+        float2 FinalUV_B = ndc_B * float2(rtSizeX, rtSizeX);
+
+        // 写入RGB三通道焦散强度（原子操作累加）
+        uint2 pixelCoordR = (uint2)FinalUV_R;
+        uint2 pixelCoordG = (uint2)FinalUV_G;
+        uint2 pixelCoordB = (uint2)FinalUV_B;
+
+        // 边界检查并写入
+        [branch]
+        if (all(pixelCoordR < uint2(rtSizeX, rtSizeX)) &&
+            all(pixelCoordG < uint2(rtSizeX, rtSizeX)) &&
+            all(pixelCoordB < uint2(rtSizeX, rtSizeX)) &&
+            intensityValue > 0)
+        {
+            InterlockedAdd(_causticIrradianceRT_R[pixelCoordR], intensityValue);
+            InterlockedAdd(_causticIrradianceRT_G[pixelCoordG], intensityValue);
+            InterlockedAdd(_causticIrradianceRT_B[pixelCoordB], intensityValue);
+        }
+    #else
+        float2 FinalUV_G = ndc_G * float2(rtSizeX, rtSizeX);
+        uint2 pixelCoordG = (uint2)FinalUV_G;
+        
+        [branch]
+        if (all(pixelCoordG < uint2(rtSizeX, rtSizeX)) && intensityValue > 0)
+        {
+            InterlockedAdd(_causticIrradianceRT_G[pixelCoordG], intensityValue);
+        }
+    #endif
+#endif
+
+}
+
+// ===================================================================================
+// À-trous降噪 - 第一次迭代（仅单通道，使用LDS优化）
+// ===================================================================================
+
+// À-trous参数
+float _AtrousLuminanceWeight;
+
+// 3x3 À-trous核（高斯权重）
+static const float atrousKernel3x3[3][3] = {
+    {1.0/16.0, 2.0/16.0, 1.0/16.0},
+    {2.0/16.0, 4.0/16.0, 2.0/16.0},
+    {1.0/16.0, 2.0/16.0, 1.0/16.0}
+};
+
+// LDS布局：16x16 + 边界（±1像素）= 18x18
+#define ATROUS_LDS_SIZE (GROUP_SIZE_X + 2)
+
+groupshared float sharedColor[ATROUS_LDS_SIZE][ATROUS_LDS_SIZE];
+
+// 单通道À-trous第一次迭代
+[numthreads(GROUP_SIZE_X, GROUP_SIZE_Y, 1)]
+void AtrousDenoiseFirst_Single(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID,uint3 Gid : SV_GroupID) 
+{
+    uint rtSize;
+    _causticIrradianceRT_G_Read.GetDimensions(rtSize, rtSize);
+    
+    // 1. 加载数据到LDS（只加载颜色，包含边界）
+    int2 groupBase = int2(Gid.xy * GROUP_SIZE_X) - 1;
+    uint2 localCoord = GTid.xy;
+    
+    // 每个线程加载主数据块（对应到 LDS 的 [1-16][1-16] 区域）
+    int2 loadPos = groupBase + int2(localCoord) + int2(1, 1);
+    int2 ldsPos = int2(localCoord) + int2(1, 1);
+    
+    if (all(loadPos >= 0 && loadPos < (int)rtSize)) {
+        uint g = _causticIrradianceRT_G_Read[loadPos];
+        sharedColor[ldsPos.y][ldsPos.x] = (float)g * DIGITS_OFFSET_L;
+    } else {
+        sharedColor[ldsPos.y][ldsPos.x] = 0;
+    }
+    
+    // 边界线程加载额外数据（只加载颜色）
+    // 左边界
+    if (localCoord.x == 0) {
+        int2 leftPos = groupBase + int2(0, localCoord.y + 1);
+        if (all(leftPos >= 0 && leftPos < (int)rtSize)) {
+            uint g = _causticIrradianceRT_G_Read[leftPos];
+            sharedColor[localCoord.y + 1][0] = (float)g * DIGITS_OFFSET_L;
+        } else {
+            sharedColor[localCoord.y + 1][0] = 0;
+        }
+    }
+    
+    // 右边界
+    if (localCoord.x == GROUP_SIZE_X - 1) {
+        int2 rightPos = groupBase + int2(GROUP_SIZE_X + 1, localCoord.y + 1);
+        if (all(rightPos >= 0 && rightPos < (int)rtSize)) {
+            uint g = _causticIrradianceRT_G_Read[rightPos];
+            sharedColor[localCoord.y + 1][GROUP_SIZE_X + 1] = (float)g * DIGITS_OFFSET_L;
+        } else {
+            sharedColor[localCoord.y + 1][GROUP_SIZE_X + 1] = 0;
+        }
+    }
+    
+    // 上边界
+    if (localCoord.y == 0) {
+        int2 topPos = groupBase + int2(localCoord.x + 1, 0);
+        if (all(topPos >= 0 && topPos < (int)rtSize)) {
+            uint g = _causticIrradianceRT_G_Read[topPos];
+            sharedColor[0][localCoord.x + 1] = (float)g * DIGITS_OFFSET_L;
+        } else {
+            sharedColor[0][localCoord.x + 1] = 0;
+        }
+    }
+    
+    // 下边界
+    if (localCoord.y == GROUP_SIZE_Y - 1) {
+        int2 bottomPos = groupBase + int2(localCoord.x + 1, GROUP_SIZE_Y + 1);
+        if (all(bottomPos >= 0 && bottomPos < (int)rtSize)) {
+            uint g = _causticIrradianceRT_G_Read[bottomPos];
+            sharedColor[GROUP_SIZE_Y + 1][localCoord.x + 1] = (float)g * DIGITS_OFFSET_L;
+        } else {
+            sharedColor[GROUP_SIZE_Y + 1][localCoord.x + 1] = 0;
+        }
+    }
+    
+    // 四个角
+    if (localCoord.x == 0 && localCoord.y == 0) {
+        int2 cornerPos = groupBase;
+        if (all(cornerPos >= 0 && cornerPos < (int)rtSize)) {
+            uint g = _causticIrradianceRT_G_Read[cornerPos];
+            sharedColor[0][0] = (float)g * DIGITS_OFFSET_L;
+        } else {
+            sharedColor[0][0] = 0;
+        }
+    }
+    
+    if (localCoord.x == GROUP_SIZE_X - 1 && localCoord.y == 0) {
+        int2 cornerPos = groupBase + int2(GROUP_SIZE_X + 1, 0);
+        if (all(cornerPos >= 0 && cornerPos < (int)rtSize)) {
+            uint g = _causticIrradianceRT_G_Read[cornerPos];
+            sharedColor[0][GROUP_SIZE_X + 1] = (float)g * DIGITS_OFFSET_L;
+        } else {
+            sharedColor[0][GROUP_SIZE_X + 1] = 0;
+        }
+    }
+    
+    if (localCoord.x == 0 && localCoord.y == GROUP_SIZE_Y - 1) {
+        int2 cornerPos = groupBase + int2(0, GROUP_SIZE_Y + 1);
+        if (all(cornerPos >= 0 && cornerPos < (int)rtSize)) {
+            uint g = _causticIrradianceRT_G_Read[cornerPos];
+            sharedColor[GROUP_SIZE_Y + 1][0] = (float)g * DIGITS_OFFSET_L;
+        } else {
+            sharedColor[GROUP_SIZE_Y + 1][0] = 0;
+        }
+    }
+    
+    if (localCoord.x == GROUP_SIZE_X - 1 && localCoord.y == GROUP_SIZE_Y - 1) {
+        int2 cornerPos = groupBase + int2(GROUP_SIZE_X + 1, GROUP_SIZE_Y + 1);
+        if (all(cornerPos >= 0 && cornerPos < (int)rtSize)) {
+            uint g = _causticIrradianceRT_G_Read[cornerPos];
+            sharedColor[GROUP_SIZE_Y + 1][GROUP_SIZE_X + 1] = (float)g * DIGITS_OFFSET_L;
+        } else {
+            sharedColor[GROUP_SIZE_Y + 1][GROUP_SIZE_X + 1] = 0;
+        }
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // 2. À-trous滤波（仅处理有效像素）
+    if (all(DTid.xy < rtSize)) 
+    {
+        int2 centerLDS = int2(localCoord) + int2(1, 1);
+        float centerColor = sharedColor[centerLDS.y][centerLDS.x];
+        float centerLum = centerColor;
+        
+        float result = 0;
+        float weightSum = 0;
+        
+        // 3x3卷积（只用亮度权重）
+        [unroll]
+        for (int y = -1; y <= 1; y++) 
+        {
+            [unroll]
+            for (int x = -1; x <= 1; x++) 
+            {
+                int2 sampleLDS = centerLDS + int2(x, y);
+                float sampleColor = sharedColor[sampleLDS.y][sampleLDS.x];
+                float sampleLum = sampleColor;
+                
+                float spatialWeight = atrousKernel3x3[y + 1][x + 1];
+                float edgeWeight = ComputeEdgeWeight(centerLum, sampleLum, _AtrousLuminanceWeight);
+                float w = spatialWeight * lerp(edgeWeight, 1.0, 0.25);
+                
+                result += sampleColor * w;
+                weightSum += w;
+            }
+        }
+        
+        result /= max(weightSum, 1e-6);
+        
+        // 3. 写入causticColor（浮点格式）
+        _causticRT_Color_FLOAT[DTid.xy] = result;
+    }
+}

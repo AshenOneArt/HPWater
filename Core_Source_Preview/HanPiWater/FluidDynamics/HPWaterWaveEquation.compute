@@ -1,0 +1,155 @@
+#pragma kernel UpdateWaveEquation
+
+#pragma only_renderers d3d11 playstation xboxone xboxseries vulkan metal switch
+
+// SRP includes
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+// 纹理缓冲（Ping-Pong）
+RWTexture2D<float> _WaveHeightNext;         // 输出：下一时刻波高 t+1
+Texture2D<float> _WaveHeightCurrent;        // 输入：当前时刻波高 t
+Texture2D<float> _WaveHeightPrevious;       // 输入：上一时刻波高 t-1
+Texture2D<float> _HPWaterHeight;       // 输入：水体深度纹理
+Texture2D<float> _HPSceneHeight;       // 输入：场景深度纹理
+
+// 波动方程参数
+float _WaveSpeed;                           // 波速 c
+float _DampingFactor;                       // 阻尼系数 (0-1)
+float _DeltaTime;                           // 时间步长 Δt
+
+// 波源输入（单点）
+float2 _WaveSourceUV;                       // 波源UV坐标 (0-1)
+float _WaveSourceIntensity;                 // 波源强度（0表示无输入）
+float _WaveSourceRadius;                    // 波源半径（像素）
+
+bool IsObstacle(float waterHeight,float sceneHeight)
+{
+    return waterHeight < sceneHeight; 
+}
+
+[numthreads(8, 8, 1)]
+void UpdateWaveEquation(uint3 id : SV_DispatchThreadID)
+{
+    uint width;
+    _WaveHeightCurrent.GetDimensions(width, width);
+    // 边界检查
+    if (id.x >= width || id.y >= width)
+        return;
+    
+    int2 coord = int2(id.xy);
+
+    float waterHeight = _HPWaterHeight[coord].r;
+    float sceneHeight = _HPSceneHeight[coord].r;
+    if(IsObstacle(waterHeight,sceneHeight))
+    {
+        _WaveHeightNext[coord] = 0;
+        return;
+    }
+    
+
+    // 读取当前像素的波高
+    float u_current = _WaveHeightCurrent[coord];
+    float u_prev = _WaveHeightPrevious[coord];
+    
+    // 读取相邻像素波高
+    float u_left = 0.0;
+    float u_right = 0.0;
+    float u_up = 0.0;
+    float u_down = 0.0;
+ 
+
+    if (coord.x > 0)
+        u_left = _WaveHeightCurrent[coord + int2(-1, 0)];
+        
+    if (coord.x < (int)width - 1)
+        u_right = _WaveHeightCurrent[coord + int2(1, 0)];
+        
+    if (coord.y > 0)
+        u_down = _WaveHeightCurrent[coord + int2(0, -1)];
+
+    if (coord.y < (int)width - 1)
+        u_up = _WaveHeightCurrent[coord + int2(0, 1)];
+
+    // 定义四个方向的 Obstacle 状态 (默认为 true/墙，防止越界)
+    bool obs_left = true;
+    bool obs_right = true;
+    bool obs_up = true;
+    bool obs_down = true;
+
+    // 只有坐标在范围内时，才去读纹理判断是不是真墙
+    // 如果坐标越界，它保持为 true (墙)，这样水波就会在屏幕边缘自动反弹
+    if (coord.x > 0) 
+        obs_left = IsObstacle(_HPWaterHeight[coord + int2(-1, 0)].r, _HPSceneHeight[coord + int2(-1, 0)].r);
+    
+    if (coord.x < (int)width - 1) 
+        obs_right = IsObstacle(_HPWaterHeight[coord + int2(1, 0)].r, _HPSceneHeight[coord + int2(1, 0)].r);
+        
+    if (coord.y > 0) 
+        obs_down = IsObstacle(_HPWaterHeight[coord + int2(0, -1)].r, _HPSceneHeight[coord + int2(0, -1)].r);
+        
+    if (coord.y < (int)width - 1) 
+        obs_up = IsObstacle(_HPWaterHeight[coord + int2(0, 1)].r, _HPSceneHeight[coord + int2(0, 1)].r);
+
+    //=========================诺伊曼边界 (反射)===========================
+    // 如果是墙（或者是屏幕边缘），把邻居设为自己 -> 导数为0 -> 反射
+    if (obs_left)  u_left = u_current;
+    if (obs_right) u_right = u_current;
+    if (obs_down)  u_down = u_current;
+    if (obs_up)    u_up = u_current;
+
+    // 波动方程离散化
+    // ∂²u/∂t² = c²(∂²u/∂x² + ∂²u/∂y²)
+    // 使用中心差分法：
+    // u(t+Δt) = 2u(t) - u(t-Δt) + c²Δt²∇²u
+    // 注意：在像素空间中，dx = 1（像素），所以Laplacian不需要额外除以dx²
+    _DeltaTime = 1/60.0;
+    float laplacian = (u_left + u_right + u_up + u_down - 4.0 * u_current);
+    float c2 = _WaveSpeed * _WaveSpeed;
+    float dt2 = _DeltaTime * _DeltaTime;
+
+    //==============================动态阻尼(海绵层)================================
+    //=============================================================================
+    float thickness = width * 0.1;
+    float distToEdgeX = min(id.x, width - 1 - id.x);
+    float distToEdgeY = min(id.y, width - 1 - id.y);
+    float edgeX = 1.0 - smoothstep(0.0, thickness, distToEdgeX);
+    float edgeY = 1.0 - smoothstep(0.0, thickness, distToEdgeY);
+    
+    //===============海绵层吸收率===============
+    float absorption = 1.0 - (1.0 - edgeX) * (1.0 - edgeY);
+    absorption = saturate(1 - absorption * absorption);
+
+    //===============能量保留率===============
+    float energyRetention = (1 - _DampingFactor) * absorption;
+    
+    // CFL稳定性条件: c*dt/dx < 1/sqrt(2) ≈ 0.707 (2D)
+    float inertia = (u_current - u_prev) * energyRetention;
+    float u_next = u_current + inertia + c2 * dt2 * laplacian;
+
+    // 添加波源Force（高斯分布）
+    if (_WaveSourceIntensity > 0.001)
+    {
+        // 计算当前像素的UV坐标
+        float2 pixelUV = (float2(id.xy) + 0.5) * rcp(width);
+        
+        // 计算到波源的距离（UV空间）
+        float2 distUV = pixelUV - _WaveSourceUV;
+        
+        // 转换为像素距离
+        float2 distPixels = distUV * width;
+        float r = length(distPixels);
+        
+        // 高斯分布波源
+        if (r < _WaveSourceRadius)
+        {
+            float sigma = _WaveSourceRadius * 0.4;  // 标准差
+            float gaussian = exp(-r * r * rcp(2.0 * sigma * sigma));
+            float ripple = min(gaussian * _WaveSourceIntensity, 0.05);
+            u_next += ripple * absorption;
+        }
+    }
+    
+    
+    // 输出到下一时刻纹理
+    _WaveHeightNext[coord] = u_next;
+}

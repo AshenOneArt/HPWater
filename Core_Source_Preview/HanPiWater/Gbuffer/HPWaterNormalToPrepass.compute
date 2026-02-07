@@ -1,0 +1,34 @@
+#pragma kernel CopyWaterNormalToPrepass
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/ShaderLibrary/ShaderVariables.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/RenderPipeline/HDStencilUsage.cs.hlsl"
+
+// 输入: 水面 GBuffer0 (包含法线)
+TEXTURE2D_X(_HPWaterGBuffer0);
+// 输入: Stencil 纹理（用于判断水面像素）
+TEXTURE2D_X_UINT2(_StencilTexture);
+// 输出: Prepass NormalBuffer (需要写入水面法线)
+RW_TEXTURE2D_X(float4, _NormalBufferRW);
+
+[numthreads(8, 8, 1)]
+void CopyWaterNormalToPrepass(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 positionSS = dispatchThreadId.xy;
+    
+    // 检查是否在屏幕范围内
+    if (positionSS.x >= (uint)_ScreenSize.x || positionSS.y >= (uint)_ScreenSize.y)
+        return;
+    
+    // 使用 Stencil 判断该像素是否是水面
+    uint stencilValue = GetStencilValue(LOAD_TEXTURE2D_X(_StencilTexture, positionSS));
+    if ((stencilValue & STENCILUSAGE_WATER_SURFACE) == 0)
+        return;  // 不是水面像素，跳过
+    
+    // 复制水面法线到 prepass normal buffer
+    float4 waterNormal = LOAD_TEXTURE2D_X(_HPWaterGBuffer0, positionSS);
+    _NormalBufferRW[COORD_TEXTURE2D_X(positionSS)] = waterNormal;
+}
+

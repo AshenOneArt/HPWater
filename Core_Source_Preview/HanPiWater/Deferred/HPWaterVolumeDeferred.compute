@@ -1,0 +1,780 @@
+#pragma kernel HanPiWaterVolume
+#pragma kernel HanPiWaterSpatialFilter
+#pragma kernel HanPiWaterComposite
+
+/* #pragma enable_d3d11_debug_symbols
+#pragma use_dxc         
+#pragma target 6.0 */
+
+// Shadow qualities
+/* #pragma multi_compile _ SHADOWS_SHADOWMASK
+#pragma multi_compile SCREEN_SPACE_SHADOWS_OFF SCREEN_SPACE_SHADOWS_ON */
+#pragma multi_compile SHADOW_LOW SHADOW_MEDIUM SHADOW_HIGH
+#pragma multi_compile AREA_SHADOW_MEDIUM AREA_SHADOW_HIGH
+
+// deferred opaque always use FPTL
+#define USE_FPTL_LIGHTLIST 1
+#define _SURFACE_TYPE_TRANSPARENT 1
+#define _BlendMode BLENDMODE_ALPHA
+
+#define HP_WATER_VOLUME
+#define USE_CUSTOM_WATER_SHADOW_PARAMS // 启用自定义水体阴影参数
+#if defined(HP_WATER_VOLUME)
+    static float3 _HPWaterAbsorption = 1; // 初始化为 1，避免阴影区域未赋值时为 0
+#endif
+
+#if defined(USE_CUSTOM_WATER_SHADOW_PARAMS)
+    // Shadow parameters
+    // x: softness
+    // y: min filter size
+    // z: blocker sample count
+    // w: filter sample count    
+    float4 _HPWaterShadowParams;
+#endif
+
+// HDRP generic includes
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Macros.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/ShaderLibrary/ShaderVariables.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/HPWaterCommon.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/RenderPipeline/HDStencilUsage.cs.hlsl"
+
+
+CBUFFER_START(UnityDeferredCompute)
+    uint g_TileListOffset;
+CBUFFER_END
+
+// Input textures
+TEXTURE2D_X(_CameraColorTexture);
+TEXTURE2D_X(_DepthTexture);             // 主深度（包含水面，用于水面深度）
+// 注意：_CameraDepthTexture 已被覆盖绑定为 depthPyramidTexture（场景深度，不含水面）
+// 这样就可以直接用 _CameraDepthTexture 采样场景深度
+
+Texture2D<uint> _CausticCascadeAtlas_R; // RGB 模式：三张 R32_SInt
+Texture2D<uint> _CausticCascadeAtlas_G;
+Texture2D<uint> _CausticCascadeAtlas_B;
+Texture2D<float> _CausticCascadeAtlas_Float; // 单通道模式：一张 R32_SInt
+TEXTURE2D(_WaterNormalAtlas);//水下法线纹理
+
+// 折射 UV 纹理
+TEXTURE2D_X(_HPWaterRefractionUVBuffer);    // 全分辨率 UV 偏移 (R16G16B16A16_SFloat)
+                                             // XY: UV偏移, Z: 折射后的线性深度（避免远处量化误差）, W: 是否为水面
+
+// RTHandle UV Scale for correct texture sampling
+float4 _HPWaterColorUVScale;
+
+// 定义 LightLoop 所需的宏和变量（必须在 include 之前）
+#define HAS_LIGHTLOOP
+
+// 定义此宏以启用低分辨率噪声坐标（用于降分辨率水体渲染）
+// 这会让 HPWaterLightLoop 使用 _HPWaterLowResPositionSS 而不是 posInput.positionSS
+#define NEED_LOWRES_POSITIONINPUT
+#if defined(NEED_LOWRES_POSITIONINPUT)
+    // 低分辨率坐标全局变量，将在 HanPiWaterVolume kernel 中赋值
+    static uint2 _HPWaterLowResPositionSS;
+    static float2 _HPWaterLowResPositionNDC;
+#endif
+
+// 定义此宏以使用预计算的折射数据（来自折射纹理）
+// 这会让 HPWaterLightLoop 跳过 ComputeRefraction 计算
+#define USE_PRECOMPUTED_REFRACTION
+#if defined(USE_PRECOMPUTED_REFRACTION)
+    // 预计算的折射数据，将在 HanPiWaterVolume kernel 中从折射纹理读取并赋值
+    static float2 _HPWaterPrecomputedRefractUV;       // 折射后的屏幕 UV
+    static float  _HPWaterPrecomputedRefractDepth;    // 折射后的场景原始深度
+    static float3 _HPWaterPrecomputedRefractWorldPos; // 折射后的场景世界坐标 (相对坐标)
+#endif
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/Material.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Lighting/Lighting.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Lighting/LightLoop/LightLoopDef.hlsl"
+
+//HPWater GBuffer
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/Deferred/HPWaterLightLoopData.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/Deferred/HPWater.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/BuiltinUtilities.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/HPWaterGlobalShaderVariable.cs.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/Caustic/HPWaterCausticPass.cs.hlsl"
+
+//==============================================================================
+// HPSampleCameraColor
+//==============================================================================
+// 在 Composite kernel 中，_CameraColorTexture 绑定的是 colorPyramid (带 Mipmap 链)
+// 需要使用 _ColorPyramidUvScaleAndLimitCurrentFrame 进行 UV 缩放和边界限制以避免采样到 padding 区域
+// 参考 Lit.hlsl:1950-1957 的实现
+inline float4 HPSampleCameraColor(float2 uv, float lod)
+{
+    // 缩放 UV
+    float2 scaledUV = uv * _ColorPyramidUvScaleAndLimitCurrentFrame.xy;
+    
+    // 根据 Mip level 调整边界限制（避免采样到 RTHandle padding 区域）
+    // 公式来自 Lit.hlsl:1951-1955
+    float2 diffLimit = _ColorPyramidUvScaleAndLimitCurrentFrame.xy - _ColorPyramidUvScaleAndLimitCurrentFrame.zw;
+    float2 diffLimitMipAdjusted = diffLimit * pow(2.0, 2.0 + ceil(abs(lod)));
+    float2 limit = _ColorPyramidUvScaleAndLimitCurrentFrame.xy - diffLimitMipAdjusted;
+    
+    // 应用限制
+    scaledUV = min(scaledUV, limit);
+    
+    return SAMPLE_TEXTURE2D_X_LOD(_CameraColorTexture, s_trilinear_clamp_sampler, scaledUV, lod);
+}
+
+namespace WaterVolumeLightLoop
+{
+#undef SPECULAR_LIGHTING_ON    
+#define HP_WATER_VOLUME
+#undef HPWATER_BSDF_LIBARY_HLSL
+#undef HPWATER_LIGHT_LOOP_HLSL
+    #include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/Deferred/HPWaterBSDFLibary.hlsl"
+    #include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/Deferred/HPWaterLightLoop.hlsl"
+#undef HP_WATER_VOLUME
+}
+
+namespace WaterSpecularLightLoop
+{
+#undef HP_WATER_VOLUME    
+#define SPECULAR_LIGHTING_ON
+#undef HPWATER_BSDF_LIBARY_HLSL
+#undef HPWATER_LIGHT_LOOP_HLSL
+    #include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/Deferred/HPWaterBSDFLibary.hlsl"
+    #include "Packages/com.unity.render-pipelines.high-definition/Runtime/HanPiWater/Deferred/HPWaterLightLoop.hlsl"
+#undef SPECULAR_LIGHTING_ON
+}
+
+#pragma only_renderers d3d11 playstation xboxone xboxseries vulkan metal switch
+
+// Textures for HanPiWaterVolume kernel (低分辨率渲染)
+RW_TEXTURE2D_X(float4, _HPWaterOutputTexture);      // Write: 低分辨率水体颜色
+RW_TEXTURE2D_X(float4, _HPWaterAbsorbanceTexture);  // Write: 低分辨率吸收率
+RW_TEXTURE2D_X(float, _HPWaterDepthOutputTexture);  // Write: 线性深度
+
+// History textures (for Temporal Filtering)
+TEXTURE2D_X(_HPWaterHistoryColor);                   // Read: 上一帧低分辨率颜色
+TEXTURE2D_X(_HPWaterHistoryAbsorbance);              // Read: 上一帧吸收率
+TEXTURE2D_X(_HPWaterHistoryDepth);                   // Read: 上一帧线性深度
+
+// Textures for HanPiWaterComposite kernel (全分辨率合成)
+TEXTURE2D_X(_HPWaterLowResColor);                   // Read: 低分辨率水体颜色
+TEXTURE2D_X(_HPWaterLowResAbsorbance);              // Read: 低分辨率吸收率
+TEXTURE2D_X(_HPWaterLowResDepth);                   // Read: 低分辨率深度（折射后的场景深度）
+RW_TEXTURE2D_X(float4, _HPWaterCompositeOutput);    // Write: 全分辨率输出
+
+// Water volume resolution (lowres width, lowres height, 1/lowres width, 1/lowres height)
+float4 _HPWaterVolumeResolution;
+
+// Temporal filtering parameters
+// x: blend factor (0-1, typically 0.9)
+// y: 1 if first frame (disable blending), 0 otherwise
+// z: velocity scale
+// w: enable motion vectors
+float4 _HPWaterTemporalParams;
+
+// Filter parameters
+// x: temporal depth threshold (meters)
+// y: spatial depth sensitivity
+// z: enable temporal depth rejection (1.0 = true)
+// w: enable spatial depth aware (1.0 = true)
+float4 _HPWaterFilterParams;
+
+#define GROUP_SIZE 8
+
+// 限制最大深度，避免远裁剪面导致的极端权重
+#define MAX_DEPTH_FOR_WEIGHT 1000.0
+#define HP_WATER_VOLUME
+
+// ========================================================================
+// HanPiWaterVolume Kernel: DownSample处理水体散射和吸收率
+// ========================================================================
+//降低变量声明周期，减少寄存器的使用，能用宏计算的尽量用宏定义计算
+#define LOW_RES_COORD(groupId, groupThreadId) uint2(groupId * 8 + groupThreadId)
+#define FULL_RES_COORD(groupId, groupThreadId) uint2((float2(LOW_RES_COORD(groupId, groupThreadId)) + 0.5) * (_ScreenSize.xy * _HPWaterVolumeResolution.zw))
+[numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
+void HanPiWaterVolume(uint3 dispatchThreadId : SV_DispatchThreadID, uint2 groupThreadId : SV_GroupThreadID, uint2 groupId : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+
+    // 当前低分辨率坐标
+    uint2 lowResCoord = LOW_RES_COORD(groupId,groupThreadId);
+    
+    // 计算对应的全分辨率坐标中心点（用于采样全分辨率纹理）
+    float2 lowResPixelCenter = float2(lowResCoord) + 0.5;                    // 低分辨率像素中心
+    float2 fullResPixelCenter = lowResPixelCenter * (_ScreenSize.xy * _HPWaterVolumeResolution.zw); // 映射到全分辨率
+    uint2 fullResCoord = FULL_RES_COORD(groupId,groupThreadId);                          // 原始坐标（用于采样水体属性）
+    
+    // 计算全分辨率整数像素中心的 UV 坐标（用于线性采样）
+    // 使用 fullResCoord + 0.5 确保在整数像素中心采样
+    float2 fullResUV = (float2(fullResCoord) + 0.5) * _ScreenSize.zw;
+
+    float4 refractionData = LOAD_TEXTURE2D_X(_HPWaterRefractionUVBuffer, fullResCoord);
+    
+    // 判断是否是水面像素
+    bool isWaterPixel = refractionData.w > 0.5;
+
+    // 如果不是水面像素，输出 alpha=0 标记为无效
+    // 这样上采样时可以正确排除这些像素，避免边缘缝隙
+    [branch]
+    if (!isWaterPixel)
+    {
+        _HPWaterOutputTexture[COORD_TEXTURE2D_X(LOW_RES_COORD(groupId,groupThreadId))] = 0; 
+        _HPWaterAbsorbanceTexture[COORD_TEXTURE2D_X(LOW_RES_COORD(groupId,groupThreadId))] = 1; 
+        _HPWaterDepthOutputTexture[COORD_TEXTURE2D_X(LOW_RES_COORD(groupId,groupThreadId))] = 0;
+        return;
+    }
+
+    // 设置低分辨率坐标用于IGN生成
+#if defined(NEED_LOWRES_POSITIONINPUT)
+    _HPWaterLowResPositionSS = LOW_RES_COORD(groupId,groupThreadId);  // 低分辨率像素坐标 (整数)
+    // 低分辨率像素中心的归一化坐标 [0, 1]
+    _HPWaterLowResPositionNDC = _HPWaterLowResPositionSS * _HPWaterVolumeResolution.zw;
+#endif
+
+    // 从全分辨率 UV 纹理读取（点采样，避免边缘插值错误）
+    float2 refractedUV = refractionData.xy + fullResUV;
+    refractedUV = saturate(refractedUV);
+    
+    float sceneRawDepth = LOAD_TEXTURE2D_X(_CameraDepthTexture, refractedUV * _ScreenSize.xy).r;
+    float sceneLinearDepth = LinearEyeDepth(sceneRawDepth, _ZBufferParams);
+    
+    // 计算场景世界坐标
+    float3 sceneWorldPos = ScreenToWorldPosition(refractedUV, sceneRawDepth) - _WorldSpaceCameraPos.xyz;
+
+    // 设置预计算的折射数据，供 LightLoop 使用
+    // 使用折射坐标采样场景深度（折射后看到的场景位置）
+#if defined(USE_PRECOMPUTED_REFRACTION)
+    _HPWaterPrecomputedRefractUV = refractedUV;
+    _HPWaterPrecomputedRefractDepth = refractionData.z;
+    _HPWaterPrecomputedRefractWorldPos = sceneWorldPos;
+#endif
+
+    // 计算 PositionInputs（使用原始坐标，水面位置）
+    uint2 tileCoord    = FULL_RES_COORD(groupId,groupThreadId) *rcp(GetTileSize());
+    // 读取深度（水面深度已写入主场景深度）
+    float waterDepth = LOAD_TEXTURE2D_X(_DepthTexture, fullResCoord).x; 
+    // 计算 PositionInputs
+    PositionInputs posInput = GetPositionInput(
+        FULL_RES_COORD(groupId,groupThreadId), _ScreenSize.zw, waterDepth, UNITY_MATRIX_I_VP, UNITY_MATRIX_V, tileCoord);
+    // 计算视线方向
+    float3 V = GetWorldSpaceNormalizeViewDir(posInput.positionWS);
+
+    BSDFData bsdfData;
+    BuiltinData builtinData;
+    DecodeFromHPWaterGBuffer(posInput.positionSS, bsdfData, builtinData);
+
+    // 计算 PreLightData
+    PreLightData preLightData = GetPreLightData(V, posInput, bsdfData);
+
+    float3 absorption = 1;
+    LightLoopOutput lightLoopOutput;
+    ZERO_INITIALIZE(LightLoopOutput, lightLoopOutput);
+
+    WaterVolumeLightLoop::LightLoop(V, posInput, preLightData, bsdfData, builtinData, UINT_MAX, lightLoopOutput);
+#if defined(HP_WATER_VOLUME)
+    absorption = _HPWaterAbsorption;
+#endif
+
+    // 获取光照结果
+    float3 diffuseLighting = lightLoopOutput.diffuseLighting;
+
+    // 应用曝光
+    diffuseLighting *= GetCurrentExposureMultiplier();
+
+    // 合成最终颜色
+    float3 finalColor = diffuseLighting.rgb;
+
+    // 评估雾效并合成
+    float3 volColor, volOpacity;
+    EvaluateAtmosphericScattering(posInput, V, volColor, volOpacity);
+    //finalColor = finalColor * (1 - volOpacity) + (1) * volColor;
+
+
+    // ========================================================================
+    // Temporal Filtering: 混合当前帧和历史帧，减少噪声
+    // ========================================================================
+    float3 currentColor = finalColor.rgb;
+    float3 currentAbsorbance = absorption;
+    
+    // 1. 获取运动矢量 (Motion Vector)
+    // 采样当前全分辨率像素对应的运动矢量 (UV空间位移)
+    float2 motionVector = float2(0, 0);
+    bool enableMotionVectors = _HPWaterTemporalParams.w > 0.5;
+    [branch]
+    if(enableMotionVectors)
+    {
+        motionVector = LOAD_TEXTURE2D_X(_CameraMotionVectorsTexture, FULL_RES_COORD(groupId,groupThreadId)).xy;
+    }
+    
+    // 2. 计算重投影坐标 (Reprojection)
+    // lowResCoord 是当前帧低分辨率像素坐标
+    // 将其转换为 UV，减去 motionVector，得到上一帧对应的 UV
+    float2 currentUV = (float2(LOW_RES_COORD(groupId,groupThreadId)) + 0.5) * _HPWaterVolumeResolution.zw; // .zw = 1/width, 1/height
+    float2 historyUV = currentUV - motionVector;
+    
+    // 检查是否越界
+    bool isOffScreen = any(historyUV < 0.0) || any(historyUV > 1.0);
+    
+    // 计算历史帧对应的低分辨率像素坐标 (浮点数，用于双线性插值或最近邻)
+    float2 historyPixelCoord = historyUV * _HPWaterVolumeResolution.xy;
+    int2 historyCoord = int2(historyPixelCoord); // 最近邻采样
+    
+    // 3. 读取历史帧数据 (使用重投影后的坐标)
+    float3 historyColor = float4(LOAD_TEXTURE2D_X(_HPWaterHistoryColor, historyCoord)).xyz;
+    float3 historyAbsorbance = float4(LOAD_TEXTURE2D_X(_HPWaterHistoryAbsorbance, historyCoord)).xyz;
+    
+    // 时间混合参数
+    float blendFactor = _HPWaterTemporalParams.x;      // 历史帧和当前帧的混合强度
+    bool isFirstFrame = _HPWaterTemporalParams.y > 0.5; // 首帧标志
+
+    
+    // 写入当前深度 (即使不混合也要写入，供下一帧使用)
+    // 从 refractionData.z 直接读取线性深度（已在 shader 中预计算）
+    _HPWaterDepthOutputTexture[COORD_TEXTURE2D_X(LOW_RES_COORD(groupId,groupThreadId))] = sceneLinearDepth;
+    
+    // x: temporal depth threshold (meters)
+    // y: spatial depth sensitivity
+    // z: enable temporal depth rejection (1.0 = true)
+    bool enableTemporalDepthRejection = _HPWaterFilterParams.z > 0.5;
+    float temporalDepthThreshold = _HPWaterFilterParams.x;
+    // 4. 动态调整混合权重
+    // 如果越界或首帧，禁用混合
+    if (isOffScreen || isFirstFrame)
+    {
+        historyColor = currentColor;
+        historyAbsorbance = currentAbsorbance;
+        blendFactor = 0.0;
+    }
+    else
+    {
+        // 简单的速度权重调整：运动越快，历史权重越低，以减少拖影
+        // 将 UV 速度转换为像素速度
+        float velocityScale = _HPWaterTemporalParams.z;
+        float velocity = length(motionVector * _HPWaterVolumeResolution.xy);
+        // 速度权重调整
+        float velocityWeight = saturate(1.0 - velocity * velocityScale); 
+        blendFactor *= enableMotionVectors ? velocityWeight : 1;        
+        
+        // ========================================================================
+        // History Depth Validation (防止遮挡导致的鬼影)
+        // ========================================================================
+        // 1. 读取历史深度 (使用重投影坐标 historyCoord)
+        float historyLinearDepth = LOAD_TEXTURE2D_X(_HPWaterHistoryDepth, historyCoord).r;
+        
+        // 2. 比较深度差异
+        float depthDiff = abs(sceneLinearDepth - historyLinearDepth);
+        
+        // 3. Depth Rejection
+        // 如果历史深度与当前深度差异过大，说明历史像素被遮挡或失效
+        // 阈值可以根据场景单位调整，这里设为 0.5 米
+        // 也可以使用相对深度阈值： depthDiff / sceneLinearDepth > 0.1
+        float rejectionThreshold = temporalDepthThreshold * max(sceneLinearDepth, 1.0); 
+        
+        if (depthDiff > rejectionThreshold && enableTemporalDepthRejection)
+        {
+            blendFactor = 0.0; // 丢弃历史，完全使用当前帧
+        }
+    }
+    
+    // 时间累积：混合当前帧和历史帧
+    float3 filteredColor = lerp(currentColor, historyColor, blendFactor);
+    float3 filteredAbsorbance = lerp(currentAbsorbance, historyAbsorbance, blendFactor);
+
+    //NaN保护
+    filteredColor = any(isnan(filteredColor)) ? float3(1, 0, 0) : filteredColor;
+    filteredAbsorbance = any(isnan(filteredAbsorbance)) ? float3(0, 0, 1) : filteredAbsorbance;
+    
+    // 输出到低分辨率颜色缓冲区和吸收缓冲区
+    _HPWaterOutputTexture[COORD_TEXTURE2D_X(lowResCoord)] = float4(filteredColor, 1);
+    _HPWaterAbsorbanceTexture[COORD_TEXTURE2D_X(lowResCoord)] = float4(filteredAbsorbance, 1);
+}
+
+#undef HP_WATER_VOLUME//关闭水体积渲染
+
+// ========================================================================
+// ========================================================================
+// HanPiWaterSpatialFilter Kernel: À-trous 空间滤波（ LDS）
+// ========================================================================
+// ========================================================================
+
+// À-trous 步长参数 (在C#中设置，随迭代增加：1, 2, 4, 8...)
+int _AtrousStride;
+
+// ========================================================================
+// À-trous 核大小宏定义：3 或 5
+// ========================================================================
+#define ATROUS_KERNEL_SIZE 3  // 可选值：3 或 5
+
+#if ATROUS_KERNEL_SIZE == 3
+    // À-trous 3×3 滤波权重（高斯近似）
+    static const float atrousKernel[3][3] = {
+        { 1.0 / 16.0, 2.0 / 16.0, 1.0 / 16.0 },
+        { 2.0 / 16.0, 4.0 / 16.0, 2.0 / 16.0 },
+        { 1.0 / 16.0, 2.0 / 16.0, 1.0 / 16.0 }
+    };
+    #define KERNEL_RADIUS 1
+    #define LDS_BORDER_SIZE 4    // stride <= 4
+    
+#elif ATROUS_KERNEL_SIZE == 5
+    // À-trous 5×5 滤波权重（高斯近似，σ ≈ 1.5）
+    static const float atrousKernel[5][5] = {
+        { 1.0/256.0,  4.0/256.0,  6.0/256.0,  4.0/256.0, 1.0/256.0 },
+        { 4.0/256.0, 16.0/256.0, 24.0/256.0, 16.0/256.0, 4.0/256.0 },
+        { 6.0/256.0, 24.0/256.0, 36.0/256.0, 24.0/256.0, 6.0/256.0 },
+        { 4.0/256.0, 16.0/256.0, 24.0/256.0, 16.0/256.0, 4.0/256.0 },
+        { 1.0/256.0,  4.0/256.0,  6.0/256.0,  4.0/256.0, 1.0/256.0 }
+    };
+    #define KERNEL_RADIUS 2
+    #define LDS_BORDER_SIZE 8    // stride <= 2 (因为 5×5 需要更大边界)
+#endif
+
+// LDS深度缓存
+// 对于 8×8 线程组，stride 最大值取决于核大小
+// 3×3: stride <= 4，需要 (8+4*2)×(8+4*2) = 16×16 = 256 floats (1 KB)
+// 5×5: stride <= 2，需要 (8+8*2)×(8+8*2) = 24×24 = 576 floats (2.25 KB)
+// stride 超过限制时自动回退到直接纹理采样
+#define LDS_SIZE uint(GROUP_SIZE + LDS_BORDER_SIZE * 2)
+groupshared float s_DepthCache[LDS_SIZE][LDS_SIZE];
+
+[numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
+void HanPiWaterSpatialFilter(uint3 dispatchThreadId : SV_DispatchThreadID, uint2 groupThreadId : SV_GroupThreadID, uint2 groupId : SV_GroupID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+
+    // 当前低分辨率坐标
+    uint2 lowResCoord = dispatchThreadId.xy;
+    int2 lowResCoordInt = int2(lowResCoord);
+    int2 lowResSize = int2(_HPWaterVolumeResolution.xy);
+    
+    // 线程组内的局部坐标（用于 LDS 索引）
+    int2 localCoord = int2(groupThreadId);
+    
+    // 是否使用 LDS 优化（stride 不超过边界大小）
+    // 3×3 核: stride <= 4，5×5 核: stride <= 2
+    bool useLDS = (_AtrousStride * KERNEL_RADIUS <= LDS_BORDER_SIZE);
+    
+    // ========================================================================
+    // 阶段 1: 加载深度到 LDS
+    // ========================================================================
+    [branch]
+    if (useLDS)
+    {
+        // 计算当前线程组需要加载的全局坐标范围
+        int2 groupBaseCoord = int2(groupId * GROUP_SIZE) - int2(LDS_BORDER_SIZE, LDS_BORDER_SIZE);
+        
+        // 每个线程负责加载多个深度值（因为 LDS 大小可能大于线程组大小）
+        // 16×16 LDS / 8×8 threads = 每线程需要加载 4 个值
+        const uint loadsPerThread = (LDS_SIZE * LDS_SIZE) / (GROUP_SIZE * GROUP_SIZE);
+        
+        [unroll]
+        for (uint loadIdx = 0; loadIdx < loadsPerThread; loadIdx++)
+        {
+            // 计算线性索引并转换为 2D 坐标
+            uint linearIdx = (localCoord.y * GROUP_SIZE + localCoord.x) * loadsPerThread + loadIdx;
+            uint2 ldsCoord = uint2(linearIdx % LDS_SIZE, linearIdx / LDS_SIZE);
+            
+            // 只加载有效范围内的坐标
+            if (ldsCoord.y < LDS_SIZE)
+            {
+                // 计算对应的全局纹理坐标
+                uint2 globalCoord = groupBaseCoord + ldsCoord;
+                
+                // 边界 clamp（确保不越界）
+                globalCoord = clamp(globalCoord, uint2(0, 0), lowResSize - uint2(1, 1));
+                
+                // 加载深度到 LDS
+                s_DepthCache[ldsCoord.y][ldsCoord.x] = LOAD_TEXTURE2D_X(_HPWaterLowResDepth, globalCoord).r;
+            }
+        }
+        
+        // 确保所有线程完成加载
+        GroupMemoryBarrierWithGroupSync();
+    }
+    
+    // ========================================================================
+    // 阶段 2: 边界检查和滤波
+    // ========================================================================
+    // 边界检查
+    if (any(lowResCoord >= (uint2)lowResSize))
+        return;
+    
+    // 读取中心像素深度
+    float centerDepth;
+    if (useLDS)
+    {
+        // 从 LDS 读取（中心像素在 LDS 中的坐标）
+        int2 ldsCenterCoord = localCoord + int2(LDS_BORDER_SIZE, LDS_BORDER_SIZE);
+        centerDepth = s_DepthCache[ldsCenterCoord.y][ldsCenterCoord.x];
+    }
+    else
+    {
+        // 直接从纹理读取（stride > 4 的情况）
+        centerDepth = LOAD_TEXTURE2D_X(_HPWaterLowResDepth, lowResCoord).r;
+    }
+    
+    // ========================================================================
+    // 阶段 3: À-trous 滤波
+    // ========================================================================
+    // À-trous 滤波参数
+    float epsilon = 1e-6;
+    float spatialSensitivity = _HPWaterFilterParams.y; // 深度敏感度
+    bool enableSpatialDepthAware = _HPWaterFilterParams.w > 0.5;
+    
+    // 深度深的区域→ 更多模糊（降噪）
+    // 深度浅的区域→ 更少模糊（保持细节）
+    static const float expFactor = 0.2;
+    float sceneRawDepth = (pow(expFactor, centerDepth)*rcp(expFactor) - rcp(expFactor))/(1-rcp(expFactor));
+    sceneRawDepth = exp(-sceneRawDepth);
+    float scatterModulation = lerp(0, 1, sceneRawDepth);
+    
+    // À-trous 加权累积
+    float3 filteredColor = 0;
+    float3 filteredAbsorbance = 0;
+    float totalWeight = 0;
+    
+    // À-trous 采样（带步长，核大小由宏控制）
+    [unroll]
+    for (int dy = -KERNEL_RADIUS; dy <= KERNEL_RADIUS; dy++)
+    {
+        [unroll]
+        for (int dx = -KERNEL_RADIUS; dx <= KERNEL_RADIUS; dx++)
+        {
+            // À-trous 偏移：offset = stride * kernelOffset
+            int2 offset = int2(dx, dy) * _AtrousStride;
+            int2 sampleCoord = lowResCoordInt + offset;
+            
+            // 边界 clamp
+            sampleCoord = clamp(sampleCoord, int2(0, 0), lowResSize - int2(1, 1));
+            
+            // 读取邻居像素的颜色和吸收
+            float3 neighborColor = LOAD_TEXTURE2D_X(_HPWaterLowResColor, sampleCoord).rgb;
+            float3 neighborAbsorbance = LOAD_TEXTURE2D_X(_HPWaterLowResAbsorbance, sampleCoord).rgb;
+            
+            // 读取邻居深度（优先从 LDS 读取）
+            float neighborDepth;
+            if (useLDS)
+            {
+                // 从 LDS 读取深度
+                int2 ldsCoord = localCoord + int2(LDS_BORDER_SIZE, LDS_BORDER_SIZE) + offset;
+                neighborDepth = s_DepthCache[ldsCoord.y][ldsCoord.x];
+            }
+            else
+            {
+                // stride > 4，从纹理读取
+                neighborDepth = LOAD_TEXTURE2D_X(_HPWaterLowResDepth, sampleCoord).r;
+            }
+            
+            // 空间权重（高斯）
+            float spatialWeight = atrousKernel[dy + KERNEL_RADIUS][dx + KERNEL_RADIUS];
+            
+            // 深度权重（边缘保持）
+            float depthDiff = neighborDepth - centerDepth;
+            // 如果 diff < 0 (当前像素比采样点更近)：说明是前景物体挡住了背景。
+            // -> 防止背景的雾跑到前景
+            // 如果 diff > 0 (当前像素比采样点更远)：说明是透过当前的低分格子看后面的深水
+            // -> 远处的雾包含近处的雾，插值是安全的。   
+            float absDepthDiff = abs(min(depthDiff, 0)); // 只关心 diff < 0 的情况                 
+            float depthWeight = lerp(1.0, exp(-absDepthDiff * spatialSensitivity), enableSpatialDepthAware);
+            
+            // 散射权重（清澈区域降低模糊）
+            // 中心像素是非中心采样时，散射调制权重更弱
+            bool isCenterSample = (dx == 0 && dy == 0);
+            float scatterWeight = isCenterSample ? 1.0 : scatterModulation;
+                            
+            // 组合权重
+            float weight = spatialWeight * depthWeight * scatterWeight;
+            
+            filteredColor += neighborColor * weight;
+            filteredAbsorbance += neighborAbsorbance * weight;
+            totalWeight += weight;
+        }
+    }
+    
+    // ========================================================================
+    // 阶段 4: 归一化和输出
+    // ========================================================================
+    // 归一化
+    filteredColor *= rcp(totalWeight + epsilon);
+    filteredAbsorbance *= rcp(totalWeight + epsilon);
+    
+    // 写回输出
+    _HPWaterOutputTexture[COORD_TEXTURE2D_X(lowResCoord)] = float4(filteredColor, 1);
+    _HPWaterAbsorbanceTexture[COORD_TEXTURE2D_X(lowResCoord)] = float4(filteredAbsorbance, 1);
+}
+
+#define SPECULAR_LIGHTING_ON//开启镜面反射渲染
+// ========================================================================
+// HanPiWaterComposite Kernel: Upsample水体积渲染结果到全分辨率 ColorBuffer
+// ========================================================================
+//降低变量声明周期，减少寄存器的使用，能用宏计算的尽量用宏定义计算
+#define FULL_RES_UV(Id, ScreenSize) (float2(Id) + 0.5) * ScreenSize
+[numthreads(GROUP_SIZE, GROUP_SIZE, 1)]
+void HanPiWaterComposite(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    UNITY_XR_ASSIGN_VIEW_INDEX(dispatchThreadId.z);
+    
+    uint2 fullResCoord = dispatchThreadId.xy; 
+
+    // 使用 Stencil 判断是否是水面像素
+    float4 refractionData = LOAD_TEXTURE2D_X(_HPWaterRefractionUVBuffer, fullResCoord);
+    bool isWater = refractionData.w > 0.5;
+    if (!isWater)
+    {
+        // 不是水面像素，输出原场景颜色，保险起见用非折射坐标采样
+        _HPWaterCompositeOutput[COORD_TEXTURE2D_X(fullResCoord)] = LOAD_TEXTURE2D_X(_CameraColorTexture, fullResCoord);
+        return;
+    }
+
+    // 从全分辨率 UV 纹理读取（点采样，避免边缘插值错误）
+    float2 refractedUV = refractionData.xy + FULL_RES_UV(fullResCoord, _ScreenSize.zw);
+    refractedUV = saturate(refractedUV);
+    
+    // 计算对应的低分辨率坐标（使用双线性采样获得更好的上采样质量）
+    // 方法：全分辨率像素 → 归一化 UV [0,1] → 低分辨率像素坐标
+    // 注意：需要减去 0.5 使像素中心对齐
+    float2 lowResPixel = FULL_RES_UV(fullResCoord, _ScreenSize.zw) * _HPWaterVolumeResolution.xy;      // 低分辨率像素位置（浮点）
+    float2 lowResCoord = lowResPixel - float2(0.5, 0.5);                                // 对齐到像素中心用于采样    
+    int2 lowResCoordInt = int2(floor(lowResCoord));
+    float2 lowResCoordFrac = frac(lowResCoord);
+    
+    // 边界检查，确保采样坐标在有效范围内
+    int2 maxCoord = int2(_HPWaterVolumeResolution.xy) - int2(1, 1);
+    
+    // 采样4个相邻像素进行双线性插值
+    int2 coord00 = clamp(lowResCoordInt + int2(0, 0), int2(0, 0), maxCoord);
+    int2 coord10 = clamp(lowResCoordInt + int2(1, 0), int2(0, 0), maxCoord);
+    int2 coord01 = clamp(lowResCoordInt + int2(0, 1), int2(0, 0), maxCoord);
+    int2 coord11 = clamp(lowResCoordInt + int2(1, 1), int2(0, 0), maxCoord);
+    
+    // ========================================================================
+    // 从低分辨率输入纹理读取颜色和吸收（深度感知上采样需要 4 个独立点）
+    // ========================================================================
+    float3 waterColor00 = LOAD_TEXTURE2D_X(_HPWaterLowResColor, coord00).xyz;
+    float3 waterColor10 = LOAD_TEXTURE2D_X(_HPWaterLowResColor, coord10).xyz;
+    float3 waterColor01 = LOAD_TEXTURE2D_X(_HPWaterLowResColor, coord01).xyz;
+    float3 waterColor11 = LOAD_TEXTURE2D_X(_HPWaterLowResColor, coord11).xyz;
+    
+    float3 absorbance00 = LOAD_TEXTURE2D_X(_HPWaterLowResAbsorbance, coord00).xyz;
+    float3 absorbance10 = LOAD_TEXTURE2D_X(_HPWaterLowResAbsorbance, coord10).xyz;
+    float3 absorbance01 = LOAD_TEXTURE2D_X(_HPWaterLowResAbsorbance, coord01).xyz;
+    float3 absorbance11 = LOAD_TEXTURE2D_X(_HPWaterLowResAbsorbance, coord11).xyz;
+    
+    // ========================================================================
+    // 双边上采样 (Joint Bilateral Upsampling) - 使用金字塔深度
+    // 结合双线性插值权重和深度权重，消除边缘溢出 (Halo Artifacts)
+    // 使用金字塔深度（_CameraDepthTexture）进行深度对比，需要用折射后坐标采样
+    // ========================================================================
+    
+    // 获取当前全分辨率像素折射后的场景深度（作为参考深度）
+    float sceneRawDepth = LOAD_TEXTURE2D_X(_CameraDepthTexture, refractedUV * _ScreenSize.xy).r;
+    float sceneLinearDepth = LinearEyeDepth(sceneRawDepth, _ZBufferParams);
+    // 限制最大深度，避免远裁剪面导致的极端权重    
+    sceneLinearDepth = min(sceneLinearDepth, MAX_DEPTH_FOR_WEIGHT);
+    
+    // 是否启用深度感知
+    bool enableDepthAware = _HPWaterVolumeResolution.w > 0.0;
+    
+    // ========================================================================
+    // 获取4个低分辨率采样点各自折射后的场景深度
+    float d00 = min(LOAD_TEXTURE2D_X(_HPWaterLowResDepth, coord00).r, MAX_DEPTH_FOR_WEIGHT);
+    float d10 = min(LOAD_TEXTURE2D_X(_HPWaterLowResDepth, coord10).r, MAX_DEPTH_FOR_WEIGHT);
+    float d01 = min(LOAD_TEXTURE2D_X(_HPWaterLowResDepth, coord01).r, MAX_DEPTH_FOR_WEIGHT);
+    float d11 = min(LOAD_TEXTURE2D_X(_HPWaterLowResDepth, coord11).r, MAX_DEPTH_FOR_WEIGHT);
+    // 计算深度权重（深度差异越小，权重越大）
+    float epsilon = 1e-6;
+    float w00 = enableDepthAware ? rcp(abs(d00 - sceneLinearDepth) + epsilon) : 1.0;
+    float w10 = enableDepthAware ? rcp(abs(d10 - sceneLinearDepth) + epsilon) : 1.0;
+    float w01 = enableDepthAware ? rcp(abs(d01 - sceneLinearDepth) + epsilon) : 1.0;
+    float w11 = enableDepthAware ? rcp(abs(d11 - sceneLinearDepth) + epsilon) : 1.0;
+    
+    // 双线性插值权重
+    float wb00 = (1.0 - lowResCoordFrac.x) * (1.0 - lowResCoordFrac.y);
+    float wb10 = lowResCoordFrac.x * (1.0 - lowResCoordFrac.y);
+    float wb01 = (1.0 - lowResCoordFrac.x) * lowResCoordFrac.y;
+    float wb11 = lowResCoordFrac.x * lowResCoordFrac.y;
+    
+    w00 *= wb00; 
+    w10 *= wb10; 
+    w01 *= wb01; 
+    w11 *= wb11;
+    float totalWeight = w00 + w10 + w01 + w11;
+    
+    //加权混合（处理边缘情况：所有采样点都无效时 fallback 到最近有效像素）
+    float3 waterColor = 0;
+    float3 absorbance = 0;
+    
+    waterColor = (waterColor00 * w00 + waterColor10 * w10 + waterColor01 * w01 + waterColor11 * w11) * rcp(totalWeight);
+    absorbance = (absorbance00 * w00 + absorbance10 * w10 + absorbance01 * w01 + absorbance11 * w11) * rcp(totalWeight);
+    
+    // 重新计算深度和位置信息（水面深度已写入主场景深度）
+    float waterDepth = LOAD_TEXTURE2D_X(_DepthTexture, fullResCoord).x;
+    PositionInputs posInput = GetPositionInput(fullResCoord, _ScreenSize.zw, waterDepth, UNITY_MATRIX_I_VP, UNITY_MATRIX_V, uint2(0,0));
+    
+    // 读取 BSDFData 获取吸收和散射系数
+    BSDFData bsdfData;
+    BuiltinData builtinData;
+    DecodeFromHPWaterGBuffer(posInput.positionSS, bsdfData, builtinData);
+    
+    // ========================================================================
+    // Deffered Specular Lighting
+    // ========================================================================
+    // 计算视线方向
+    float3 V = GetWorldSpaceNormalizeViewDir(posInput.positionWS);
+
+    // 计算 PreLightData（BSDFData 已在上面解码）
+    PreLightData preLightData = GetPreLightData(V, posInput, bsdfData);
+    LightLoopOutput lightLoopOutput;
+    ZERO_INITIALIZE(LightLoopOutput, lightLoopOutput);
+
+    WaterSpecularLightLoop::LightLoop(V, posInput, preLightData, bsdfData, builtinData, UINT_MAX, lightLoopOutput);
+
+    // 获取光照结果
+    float3 specularLighting = lightLoopOutput.specularLighting;
+
+    // 应用曝光
+    specularLighting *= GetCurrentExposureMultiplier();
+
+    // 合成：水体颜色 + 镜面反射
+    float3 finalColor =  waterColor + specularLighting;
+
+    // 评估雾效并合成
+    float3 volColor, volOpacity;
+    EvaluateAtmosphericScattering(posInput, V, volColor, volOpacity);
+    finalColor = finalColor + volColor * (1 - absorbance);
+
+#define WATER_DISPERSION_UV_CLAMP  0.01
+    // 合成：+场景颜色 * 吸收    
+    // 读取全分辨率场景颜色（使用折射后的坐标）
+
+    // 计算光线穿越距离
+    float waterLinearDepth = LinearEyeDepth(waterDepth, _ZBufferParams);
+    float crossDistance = abs(sceneLinearDepth - waterLinearDepth);
+    
+    // 应用NoLinear缩放，限制最大距离（参考HPWaterLightLoop.hlsl:357-359）
+    float NoLinearScaleFactor = min(crossDistance, _MaxCrossDistance) / (crossDistance + 1e-8);
+    float NoLinearRayLength = crossDistance * NoLinearScaleFactor;
+    
+    // 计算散射强度（散射系数的亮度平均值）
+    float scatterDensity = Luminance(bsdfData.scatterColor);
+    
+    // 计算模糊等级（HPWaterBSDFLibary.hlsl）
+    float blurMipLevel = CalculateHPWaterMipLevel(crossDistance, WATER_SCALING_FACTOR, scatterDensity, 6);
+    
+    // 色散处理：在UV空间计算色散偏移
+    float2 baseUV = FULL_RES_UV(fullResCoord, _ScreenSize.zw);
+    float2 refractionDeltaUV = refractedUV - baseUV;  // UV空间的折射偏移
+    float2 dispersionUV = clamp(refractionDeltaUV * _WaterDispersionStrength,
+         -WATER_DISPERSION_UV_CLAMP, WATER_DISPERSION_UV_CLAMP);
+    
+    // 使用refractedUV采样场景颜色（带色散）
+    float sceneColorG = HPSampleCameraColor(refractedUV, blurMipLevel).g;
+    float sceneColorR = HPSampleCameraColor(refractedUV + dispersionUV, blurMipLevel).r;
+    float sceneColorB = HPSampleCameraColor(refractedUV - dispersionUV, blurMipLevel).b;
+    
+    float3 sceneColor = float3(sceneColorR, sceneColorG, sceneColorB);
+    finalColor += sceneColor * absorbance;
+
+    //NaN保护
+    finalColor = any(isnan(finalColor)) ? float3(1, 1, 0) : finalColor;
+    
+    // 输出最终颜色
+    _HPWaterCompositeOutput[COORD_TEXTURE2D_X(fullResCoord)] = float4(finalColor.rgb,1);
+}
+#undef SPECULAR_LIGHTING_ON//关闭镜面反射渲染
