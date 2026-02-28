@@ -168,11 +168,12 @@ float FogPhase(float lightPoint)
 
 	return exponential;
 }
-float HenyeyPhase(float cos_theta,float PhaseG)
+float HenyeyPhase(float cosTheta,float phaseG)
 {
-    //PhaseG = max(PhaseG,0.00001f);
-    const float result = (1 - PhaseG*PhaseG)/pow(abs(1 + PhaseG*PhaseG - 2 * PhaseG * cos_theta),1.5f);
-    return  result;
+    float g2 = phaseG * phaseG;
+    float denom = 1.0 + g2 - 2.0 * phaseG * cosTheta;
+    float mieScatter = (1.0 - g2) * rcp(pow(abs(denom), 1.5));
+    return  mieScatter;
 }
 
 float FresnelSchlick(float cosTheta, float F0)
@@ -185,15 +186,13 @@ float FresnelSchlick(float cosTheta, float F0)
 //==============================================================================
 float3 CaculateScatterPhase(float cosTheta,float phaseG)
 {
-    //瑞丽散射占比20%，米氏散射占比80%
+    //瑞丽散射占比5%，米氏散射占比95%
     static const float3 betaRayleigh = float3(5.8e-6, 13.5e-6, 33.1e-6); // ∝ 1/λ⁴        
     float rayleighPhase = (1.0 + cosTheta * cosTheta) * (3 / (16 * PI));
     float3 rayleighScatter = betaRayleigh * rayleighPhase * 1e6;
 
-    float g2 = phaseG * phaseG;
-    float denom = 1.0 + g2 - 2.0 * phaseG * cosTheta;
-    float mieScatter = (1.0 - g2) / pow(abs(denom), 1.5);
-    float3 scatterPhase = rayleighScatter * 0.1 + float3(mieScatter,mieScatter,mieScatter) * 0.9;
+    float mieScatter = HenyeyPhase(cosTheta,phaseG);
+    float3 scatterPhase = rayleighScatter * 0.05 + float3(mieScatter,mieScatter,mieScatter) * 0.95;
     return scatterPhase;
 }
 
@@ -211,7 +210,30 @@ float3 CaculateScatteredLight(float3 originLight,float3 absorptionCoeff,float3 s
     // 4. 计算在所有消光的光中，到底有多少是真正被散射的
     // 这个比例就是 散射系数 / 消光系数，也称为“反照率”(Albedo)
     // 为了避免除以零，需要做安全处理
-    float3 scatteringAlbedo = (extinctionCoeff > 0) ? (scatteringCoeff / extinctionCoeff) : 0;
+    float3 scatteringAlbedo = (extinctionCoeff > 0) ? (scatteringCoeff * rcp(extinctionCoeff)) : 0;
+
+    // 5. 计算出真正被散射的光量        
+    float3 scatteredLight = extinguishedLight * scatteringAlbedo;
+    scatteredLight = scatteredLight * phase;
+    return scatteredLight;
+}
+
+float3 CaculateScatteredLight(float3 originLight,float3 absorptionCoeff,float3 scatteringCoeff,float crossDistance,float3 phase,
+out float3 transmittance,out float3 scatteringAlbedo)
+{
+    // 1. 计算总的消光系数
+    float3 extinctionCoeff = absorptionCoeff + scatteringCoeff;
+
+    // 2. 计算透射率（光线幸存的比例），这里用总的消光系数
+    transmittance = exp(-extinctionCoeff * (crossDistance)); 
+
+    // 3. 计算被“消光”（吸收+散射）的总光量        
+    float3 extinguishedLight = originLight * (1.0 - transmittance);
+
+    // 4. 计算在所有消光的光中，到底有多少是真正被散射的
+    // 这个比例就是 散射系数 / 消光系数，也称为“反照率”(Albedo)
+    // 为了避免除以零，需要做安全处理
+    scatteringAlbedo = (extinctionCoeff > 0) ? (scatteringCoeff * rcp(extinctionCoeff)) : 0;
 
     // 5. 计算出真正被散射的光量        
     float3 scatteredLight = extinguishedLight * scatteringAlbedo;
@@ -234,9 +256,11 @@ float3 WaterVolumetrics(
     PositionInputs posInput,
     LightLoopContext lightLoopContext,
     BSDFData bsdfData,
+    float NdotV,  // 预计算的 NdotV，用于厚度近似（法线朝向相机处更薄）
     
     // Output
-    out float3 accumTransmittance)
+    out float3 accumTransmittance,
+    out SHADOW_TYPE lastShadowValue)
 {    
     // Initialize variables        
     float3 RayStart                 = waterLightLoopData.RelativeStartPos;
@@ -245,7 +269,8 @@ float3 WaterVolumetrics(
     float3 AbsorptionCoefficient    = waterLightLoopData.AbsorptionCoefficient;
     float3 ScatterCoefficient       = waterLightLoopData.ScatterCoefficient;
     float3 NoLinearRayDirection     = waterLightLoopData.NoLinearRayDirection;
-
+    float3 LinearRayDirection       = waterLightLoopData.LinearRayDirection;
+    float3 DynamicRayDirection       = waterLightLoopData.NoLinearDynamicRayDirection;
     float NoLinearRayLength         = waterLightLoopData.NoLinearRayLength;    
     float AmbientDepth              = waterLightLoopData.NoLinearAmbientDepth;
     float SunDepth                  = waterLightLoopData.NoLinearSunDepth;    
@@ -256,34 +281,59 @@ float3 WaterVolumetrics(
     float3  causticValue    = 1;
     float3 scatteredLight   = 0;
     float3 transmittance    = 0;    
+    float3 scatteringAlbedo = 0;
     SHADOW_TYPE   shadowValue     = 1;
+    lastShadowValue        = 1;
     
   
     float verticalFactor = -safeNormalize(NoLinearRayDirection).y;
     verticalFactor = clamp(verticalFactor - 0.15, 0.0, 1.0);
     verticalFactor = pow(1.0 - pow(1.0 - verticalFactor, 2.0), 2.0);
-    verticalFactor *= 5;     
+    verticalFactor *= 5;
 
+    // ===== 指数步进参数预计算 =====
+    //
+    // 目标：将 [0, 1] 区间映射到指数分布的采样点，近处密集、远处稀疏
+    //
+    // 数学推导：
+    //   设 t ∈ [0, 1] 是归一化的采样索引（t = i/N）
+    //   指数映射：d(t) = (e^(k·t) - 1) / (e^k - 1)，其中 k = ln(EXP_FACTOR)
+    //   当 t=0 时 d=0，当 t=1 时 d=1
+    //
+    // 实现优化：
+    //   令 currentExp = e^(k·t) = EXP_FACTOR^t
+    //   则 d = (currentExp - 1) / (EXP_FACTOR - 1) = (currentExp - 1) * kDenom
+    //   步长 dd = d'(t) · dt = currentExp · k / (e^k - 1) · (1/N) = currentExp · kDD
+    //
     float rcpCount = rcp(float(WATER_SAMPLE_COUNT));
     float kDenom = rcp(EXP_FACTOR - 1.0);
     float kDD = log(EXP_FACTOR) * rcpCount * kDenom;
 
-    // 预计算步进乘数：exp(ln(EXP_FACTOR) / N) -> EXP_FACTOR^(1/N)
+    // expStep = EXP_FACTOR^(1/N)，每次迭代乘以它来递增 currentExp
     float expStep = pow(EXP_FACTOR, rcpCount);
 
-    // 计算起始点的 exp 值：expFactor^(Dither/N)
+    // Dither 抖动起始点，减少带状 artifact
     float currentExp = pow(EXP_FACTOR, Dither * rcpCount);
-          
+
     for (int i = 0; i < WATER_SAMPLE_COUNT; i++)
     {
+        // d: 归一化采样位置 [0, 1]，乘以 RayLength 得到实际距离
+        // dd: 当前步的归一化步长
         float d = (currentExp - 1.0) * kDenom;
         float dd = currentExp * kDD;   
         float3 samplePos = RayStart + NoLinearRayDirection * d;  
+        float3 samplePosLinear = RayStart + LinearRayDirection * d;
+        float3 samplePosDynamic = RayStart + DynamicRayDirection * d;
         
-        shadowValue = ComputeShadowValue(samplePos,featureFlags,lightLoopContext,posInput,bsdfData);
-        causticValue = ComputeCausticValue(samplePos,shadowValue,featureFlags,lightLoopContext,posInput,bsdfData); 
+        shadowValue = ComputeShadowValue(samplePosDynamic,featureFlags,lightLoopContext,posInput,bsdfData);
+        if(i == 0)
+        {
+            lastShadowValue = shadowValue;
+        }
+        
+        //causticValue = ComputeCausticValue(samplePosLinear,shadowValue,featureFlags,lightLoopContext,posInput,bsdfData); 
         //焦散的分布会从水面到水下，呈无分散到有分散，到达底部将会变成受折射后的焦散图采样结果
-        causticValue = lerp(1,saturate(causticValue + 0.5), d);
+        causticValue = 1;
 
         // ===== 一次散射：直接光照 =====
         float cosTheta = dot(safeNormalize(samplePos), safeNormalize(LightDir));
@@ -291,25 +341,45 @@ float3 WaterVolumetrics(
         float3 directLighting = LightColor * shadowValue * causticValue;
         float directCrossDistance = dd * NoLinearRayLength + SunDepth * dd;        
 
-        float3 directScatteredLight = CaculateScatteredLight(
+        // 先计算不带相位的基础散射（phase = 1）
+        float3 baseScatter = CaculateScatteredLight(
             directLighting, AbsorptionCoefficient, ScatterCoefficient,
-            directCrossDistance, scatterPhase, transmittance).rgb; 
+            directCrossDistance, 1, transmittance, scatteringAlbedo).rgb; 
+        
+        // 多次散射效果：根据透射率决定相位的各向同性程度
+        // transmittance 高 -> 薄介质 -> 单次散射主导 -> 保留方向性相位
+        // transmittance 低 -> 厚介质 -> 多次散射充分 -> 相位趋于各向同性
+        float scatterAlbedo = Luminance(scatteringAlbedo) * GetInverseCurrentExposureMultiplier();
+        float3 effectivePhase = lerp(scatterPhase, 1.0, saturate(smoothstep(0,0.5,scatterAlbedo)));
+        
+        float3 directScatteredLight = baseScatter * effectivePhase;
         
         accumTransmittance *= transmittance;
         scatteredLight += directScatteredLight;
         currentExp *= expStep;
+        shadowValue *= shadowValue;
     }
-    // ===== 二次散射：场景光照 =====
-    // 也考虑阴影,30%的阴影能穿越
-    float3 sceneLight = SceneColor * lerp(shadowValue,1,0.3);
-    // 光源 * 散射系数 * 总透射率 * 距离 * 相位 * 光源修正(使用亮度而非颜色)
+    // ===== 水下场景散射（Scene In-Scattering）=====
+    // 
+    // 物理含义：水下物体反射的光，在穿过水体到达摄像机的过程中，也会被散射
+    // 这会产生"雾化"效果，让远处的水下物体看起来更模糊、更偏向散射色
+    //
+    // 简化公式（避免对场景光再做完整 ray marching）：
+    //   sceneScatteredLight = sceneLight × T_accum × μs × d × I_sun
+    //
+    // 各项含义：
+    //   sceneLight：水下场景光（考虑 30% 阴影穿透，因为水下阴影较软）
+    //   T_accum：累积透射率（场景光穿过水体的衰减）
+    //   μs：散射系数（决定多少光被散射出来）
+    //   d：光程长度（路径越长散射越多）
+    //   I_sun：光源亮度（用于调制，使场景散射与直接光散射亮度一致）
+    //
+    float3 sceneLight = SceneColor * lerp(shadowValue, 1, 0.3);
     float lightIntensity = Luminance(LightColor);
     float3 sceneScatteredLight = sceneLight * accumTransmittance * ScatterCoefficient * NoLinearRayLength * lightIntensity;
     scatteredLight += sceneScatteredLight;
-    float fresneNdotV = saturate(dot(safeNormalize(bsdfData.normalWS), -safeNormalize(RayStart)));// 取反，从表面指向相机
-    float scatterGain = saturate(dot(safeNormalize(bsdfData.normalWS), -safeNormalize(float3(RayStart.x,0,RayStart.z))));
 
-    return scatteredLight;// 水的基础反射率约为 2%
+    return scatteredLight;
 }
 
 #endif

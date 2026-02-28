@@ -7,7 +7,7 @@ namespace UnityEngine.Rendering.HighDefinition
     {
         // 水体积历史纹理（用于 Temporal Filtering）
         RTHandle m_WaterVolumeHistoryColor = null;
-        RTHandle m_WaterVolumeHistoryAbsorbance = null;
+        RTHandle m_WaterVolumeHistoryTransmittance = null;
         RTHandle m_WaterVolumeHistoryDepth = null;
         bool m_WaterVolumeFirstFrame = true;
         int m_WaterVolumeHistoryWidth = 0;
@@ -21,13 +21,13 @@ namespace UnityEngine.Rendering.HighDefinition
             public static readonly int _HPWaterGBuffer1 = Shader.PropertyToID("_HPWaterGBuffer1");
             public static readonly int _HPWaterGBuffer2 = Shader.PropertyToID("_HPWaterGBuffer2");
             public static readonly int _HPWaterOutputTexture = Shader.PropertyToID("_HPWaterOutputTexture");
-            public static readonly int _HPWaterAbsorbanceTexture = Shader.PropertyToID("_HPWaterAbsorbanceTexture");
+            public static readonly int _HPWaterTransmittanceTexture = Shader.PropertyToID("_HPWaterTransmittanceTexture");
             public static readonly int _HPWaterLowResColor = Shader.PropertyToID("_HPWaterLowResColor");
-            public static readonly int _HPWaterLowResAbsorbance = Shader.PropertyToID("_HPWaterLowResAbsorbance");
+            public static readonly int _HPWaterLowResTransmittance = Shader.PropertyToID("_HPWaterLowResTransmittance");
             public static readonly int _HPWaterLowResDepth = Shader.PropertyToID("_HPWaterLowResDepth");
             public static readonly int _HPWaterCompositeOutput = Shader.PropertyToID("_HPWaterCompositeOutput");
             public static readonly int _HPWaterHistoryColor = Shader.PropertyToID("_HPWaterHistoryColor");
-            public static readonly int _HPWaterHistoryAbsorbance = Shader.PropertyToID("_HPWaterHistoryAbsorbance");
+            public static readonly int _HPWaterHistoryTransmittance = Shader.PropertyToID("_HPWaterHistoryTransmittance");
             public static readonly int _HPWaterHistoryDepth = Shader.PropertyToID("_HPWaterHistoryDepth");
             public static readonly int _HPWaterDepthOutputTexture = Shader.PropertyToID("_HPWaterDepthOutputTexture");
             public static readonly int _HPWaterTemporalParams = Shader.PropertyToID("_HPWaterTemporalParams");
@@ -83,12 +83,12 @@ namespace UnityEngine.Rendering.HighDefinition
             
             // Output textures
             public TextureHandle lowResColorBuffer;      // 低分辨率水体颜色（当前帧）
-            public TextureHandle absorbanceBuffer;       // 吸收缓冲（当前帧）
+            public TextureHandle transmittanceBuffer;       // 透射率缓冲（当前帧）
             public TextureHandle depthOutputBuffer;      // 深度输出缓冲（当前帧）
             
             // History textures (for temporal filtering)
             public TextureHandle historyColorBuffer;      // 历史颜色缓冲（上一帧）
-            public TextureHandle historyAbsorbanceBuffer; // 历史吸收缓冲（上一帧）
+            public TextureHandle historyTransmittanceBuffer; // 历史透射率缓冲（上一帧）
             public TextureHandle historyDepthBuffer;      // 历史深度缓冲（上一帧）
             
             // Temporal parameters
@@ -114,7 +114,7 @@ namespace UnityEngine.Rendering.HighDefinition
             public TextureHandle depthBuffer;      // 主场景深度（包含水面，用于 Stencil）
             public TextureHandle depthPyramidBuffer;  // 场景深度（不含水面）
             public TextureHandle lowResColorBuffer;
-            public TextureHandle absorbanceBuffer;
+            public TextureHandle transmittanceBuffer;
             public TextureHandle lowResDepthBuffer;    // 低分辨率深度（折射后的场景深度）
             // 折射 UV 纹理
             public TextureHandle refractionUVBuffer;    // 全分辨率 UV 偏移
@@ -179,10 +179,10 @@ namespace UnityEngine.Rendering.HighDefinition
                 (m_WaterVolumeHistoryWidth != width || m_WaterVolumeHistoryHeight != height))
             {
                 RTHandles.Release(m_WaterVolumeHistoryColor);
-                RTHandles.Release(m_WaterVolumeHistoryAbsorbance);
+                RTHandles.Release(m_WaterVolumeHistoryTransmittance);
                 RTHandles.Release(m_WaterVolumeHistoryDepth);
                 m_WaterVolumeHistoryColor = null;
-                m_WaterVolumeHistoryAbsorbance = null;
+                m_WaterVolumeHistoryTransmittance = null;
                 m_WaterVolumeHistoryDepth = null;
                 m_WaterVolumeFirstFrame = true;
             }
@@ -199,13 +199,13 @@ namespace UnityEngine.Rendering.HighDefinition
                     name: "WaterVolumeHistoryColor"
                 );
                 
-                m_WaterVolumeHistoryAbsorbance = RTHandles.Alloc(
+                m_WaterVolumeHistoryTransmittance = RTHandles.Alloc(
                     width, height,
                     TextureXR.slices,
                     dimension: TextureXR.dimension,
                     colorFormat: GraphicsFormat.B10G11R11_UFloatPack32,
                     enableRandomWrite: true,
-                    name: "WaterVolumeHistoryAbsorbance"
+                    name: "WaterVolumeHistoryTransmittance"
                 );
                 
                 m_WaterVolumeHistoryDepth = RTHandles.Alloc(
@@ -278,9 +278,9 @@ namespace UnityEngine.Rendering.HighDefinition
 
             // Pass 1: 在低分辨率下渲染水体体积光照
             TextureHandle lowResColorBuffer;
-            TextureHandle absorbanceBuffer;
+            TextureHandle transmittanceBuffer;
             // ========================================================================
-            // DownSample处理水体散射和吸收率
+            // DownSample处理水体散射和透射率
             // ========================================================================
             using (var builder = renderGraph.AddRenderPass<RenderWaterVolumePassData>(
                 "HanPi Water Volume Deferred Lighting (LowRes)", out var passData, new ProfilingSampler("HanPi Water Volume Deferred Lighting")))
@@ -331,7 +331,7 @@ namespace UnityEngine.Rendering.HighDefinition
                 // 导入历史纹理（读取上一帧数据，写入更新后数据）
                 // 注意：历史纹理通过 CopyTexture 写入，需要声明 ReadWrite 权限
                 passData.historyColorBuffer = builder.ReadWriteTexture(renderGraph.ImportTexture(m_WaterVolumeHistoryColor));
-                passData.historyAbsorbanceBuffer = builder.ReadWriteTexture(renderGraph.ImportTexture(m_WaterVolumeHistoryAbsorbance));
+                passData.historyTransmittanceBuffer = builder.ReadWriteTexture(renderGraph.ImportTexture(m_WaterVolumeHistoryTransmittance));
                 passData.historyDepthBuffer = builder.ReadWriteTexture(renderGraph.ImportTexture(m_WaterVolumeHistoryDepth));
                 passData.temporalBlendFactor = Mathf.Clamp(parameters.temporalBlendFactor, 0f, 0.99f);
                 passData.isFirstFrame = m_WaterVolumeFirstFrame;
@@ -355,20 +355,20 @@ namespace UnityEngine.Rendering.HighDefinition
                 };
                 passData.lowResColorBuffer = builder.WriteTexture(renderGraph.CreateTexture(lowResColorDesc));
                 
-                // 创建吸收缓冲区 - 使用 RGBA32 UNorm 格式 (32-bit)
-                // 吸收值范围 [0,1]，可以用 8-bit UNorm，但可能有轻微色带
+                // 创建透射率缓冲区 - 使用 RGBA32 UNorm 格式 (32-bit)
+                // 透射率值范围 [0,1]，可以用 8-bit UNorm，但可能有轻微色带
                 // 如果出现色带，可以改回 R16G16B16A16_SFloat (64-bit)
-                var absorbanceDesc = new TextureDesc(lowResWidth, lowResHeight)
+                var transmittanceDesc = new TextureDesc(lowResWidth, lowResHeight)
                 {
                     slices = TextureXR.slices,  // 支持 XR
                     dimension = TextureXR.dimension,  // 支持 XR
-                    colorFormat = GraphicsFormat.B10G11R11_UFloatPack32,  // Half float, 64-bit, 吸收需要精度
+                    colorFormat = GraphicsFormat.B10G11R11_UFloatPack32,  // Half float, 64-bit, 透射率需要精度
                     enableRandomWrite = true,
-                    name = "HPWaterVolume_Absorbance",
+                    name = "HPWaterVolume_Transmittance",
                     clearBuffer = true,
-                    clearColor = Color.clear  // 默认无吸收
+                    clearColor = Color.clear  // 默认无透射
                 };
-                passData.absorbanceBuffer = builder.WriteTexture(renderGraph.CreateTexture(absorbanceDesc));
+                passData.transmittanceBuffer = builder.WriteTexture(renderGraph.CreateTexture(transmittanceDesc));
                 
                 // 创建深度输出纹理 (用于下一帧对比)
                 var depthOutputDesc = new TextureDesc(lowResWidth, lowResHeight)
@@ -450,7 +450,7 @@ namespace UnityEngine.Rendering.HighDefinition
                     ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.m_HanPiWaterVolumeKernel,
                         HPWaterVolumeShaderIDs._HPWaterHistoryColor, data.historyColorBuffer);
                     ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.m_HanPiWaterVolumeKernel,
-                        HPWaterVolumeShaderIDs._HPWaterHistoryAbsorbance, data.historyAbsorbanceBuffer);
+                        HPWaterVolumeShaderIDs._HPWaterHistoryTransmittance, data.historyTransmittanceBuffer);
                     ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.m_HanPiWaterVolumeKernel,
                         HPWaterVolumeShaderIDs._HPWaterHistoryDepth, data.historyDepthBuffer);
 
@@ -486,7 +486,7 @@ namespace UnityEngine.Rendering.HighDefinition
                     ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.m_HanPiWaterVolumeKernel, 
                         HPWaterVolumeShaderIDs._HPWaterOutputTexture, data.lowResColorBuffer);
                     ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.m_HanPiWaterVolumeKernel, 
-                        HPWaterVolumeShaderIDs._HPWaterAbsorbanceTexture, data.absorbanceBuffer);
+                        HPWaterVolumeShaderIDs._HPWaterTransmittanceTexture, data.transmittanceBuffer);
                     ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.m_HanPiWaterVolumeKernel,
                         HPWaterVolumeShaderIDs._HPWaterDepthOutputTexture, data.depthOutputBuffer);
                     data.m_HanPiWaterVolumeCS.GetKernelThreadGroupSizes(data.m_HanPiWaterVolumeKernel, out uint x, out uint y, out _);
@@ -501,7 +501,7 @@ namespace UnityEngine.Rendering.HighDefinition
                     if (!data.waterVolumeInputData.enableSpatialFilter)
                     {
                         ctx.cmd.CopyTexture(data.lowResColorBuffer, data.historyColorBuffer);
-                        ctx.cmd.CopyTexture(data.absorbanceBuffer, data.historyAbsorbanceBuffer);
+                        ctx.cmd.CopyTexture(data.transmittanceBuffer, data.historyTransmittanceBuffer);
                     }
                     
                     // 复制当前帧深度到历史深度 (无论是否开启空间滤波)
@@ -509,7 +509,7 @@ namespace UnityEngine.Rendering.HighDefinition
                 });
 
                 lowResColorBuffer = passData.lowResColorBuffer;
-                absorbanceBuffer = passData.absorbanceBuffer;
+                transmittanceBuffer = passData.transmittanceBuffer;
             }
 
             // Pass 1.5: 空间滤波 - À-trous 迭代
@@ -523,7 +523,7 @@ namespace UnityEngine.Rendering.HighDefinition
                 // 创建用于 Ping-Pong 的临时纹理引用（重用物理内存，不创建新纹理）
                 // 这些 Handle 用于在迭代间交替读写
                 TextureHandle currentColorInput = lowResColorBuffer;
-                TextureHandle currentAbsorbanceInput = absorbanceBuffer;
+                TextureHandle currentTransmittanceInput = transmittanceBuffer;
                 
                 // À-trous 多次迭代
                 for (int i = 0; i < iterations; i++)
@@ -554,7 +554,7 @@ namespace UnityEngine.Rendering.HighDefinition
                         
                         // 输入：从当前缓冲区读取（第一次迭代从 Pass 1 输出，后续从上一次迭代结果）
                         passData.lowResColorBuffer = builder.ReadTexture(currentColorInput);
-                        passData.absorbanceBuffer = builder.ReadTexture(currentAbsorbanceInput);
+                        passData.transmittanceBuffer = builder.ReadTexture(currentTransmittanceInput);
                         
                         // 读取深度纹理（已在 Pass 1 完成写入，通过 ImportTexture 同步）
                         passData.depthOutputBuffer = builder.ReadTexture(renderGraph.ImportTexture(m_WaterVolumeHistoryDepth));
@@ -565,7 +565,7 @@ namespace UnityEngine.Rendering.HighDefinition
                         
                         // 输出：写入 History Buffer（用于下一次迭代）
                         passData.historyColorBuffer = builder.WriteTexture(renderGraph.ImportTexture(m_WaterVolumeHistoryColor));
-                        passData.historyAbsorbanceBuffer = builder.WriteTexture(renderGraph.ImportTexture(m_WaterVolumeHistoryAbsorbance));
+                        passData.historyTransmittanceBuffer = builder.WriteTexture(renderGraph.ImportTexture(m_WaterVolumeHistoryTransmittance));
                         
                         // 为下一次迭代准备：将当前输入缓冲区声明为可写（用于 CopyTexture）
                         // 这确保 RenderGraph 正确追踪资源依赖
@@ -573,7 +573,7 @@ namespace UnityEngine.Rendering.HighDefinition
                         {
                             // 不是最后一次迭代，需要复制回输入缓冲区供下一次迭代使用
                             currentColorInput = builder.WriteTexture(currentColorInput);
-                            currentAbsorbanceInput = builder.WriteTexture(currentAbsorbanceInput);
+                            currentTransmittanceInput = builder.WriteTexture(currentTransmittanceInput);
                         }
                         
                         builder.AllowPassCulling(false);
@@ -611,7 +611,7 @@ namespace UnityEngine.Rendering.HighDefinition
                             ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.m_HanPiWaterVolumeKernel,
                                 HPWaterVolumeShaderIDs._HPWaterLowResColor, data.lowResColorBuffer);
                             ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.m_HanPiWaterVolumeKernel,
-                                HPWaterVolumeShaderIDs._HPWaterLowResAbsorbance, data.absorbanceBuffer);
+                                HPWaterVolumeShaderIDs._HPWaterLowResTransmittance, data.transmittanceBuffer);
                             ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.m_HanPiWaterVolumeKernel,
                                 HPWaterVolumeShaderIDs._HPWaterLowResDepth, data.depthOutputBuffer);
                                 
@@ -619,7 +619,7 @@ namespace UnityEngine.Rendering.HighDefinition
                             ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.m_HanPiWaterVolumeKernel,
                                 HPWaterVolumeShaderIDs._HPWaterOutputTexture, data.historyColorBuffer);
                             ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.m_HanPiWaterVolumeKernel,
-                                HPWaterVolumeShaderIDs._HPWaterAbsorbanceTexture, data.historyAbsorbanceBuffer);
+                                HPWaterVolumeShaderIDs._HPWaterTransmittanceTexture, data.historyTransmittanceBuffer);
                             
                             // Dispatch
                             data.m_HanPiWaterVolumeCS.GetKernelThreadGroupSizes(data.m_HanPiWaterVolumeKernel, out uint x, out uint y, out _);
@@ -633,7 +633,7 @@ namespace UnityEngine.Rendering.HighDefinition
                             if (currentIteration < totalIterations - 1)
                             {
                                 ctx.cmd.CopyTexture(data.historyColorBuffer, data.lowResColorBuffer);
-                                ctx.cmd.CopyTexture(data.historyAbsorbanceBuffer, data.absorbanceBuffer);
+                                ctx.cmd.CopyTexture(data.historyTransmittanceBuffer, data.transmittanceBuffer);
                             }
                         });
                     }
@@ -642,7 +642,7 @@ namespace UnityEngine.Rendering.HighDefinition
                 // 更新最终结果的引用（用于后续的 Composite Pass）
                 // 最终结果在 history buffer 中
                 lowResColorBuffer = renderGraph.ImportTexture(m_WaterVolumeHistoryColor);
-                absorbanceBuffer = renderGraph.ImportTexture(m_WaterVolumeHistoryAbsorbance);
+                transmittanceBuffer = renderGraph.ImportTexture(m_WaterVolumeHistoryTransmittance);
             }
             // 标记首帧完成
             m_WaterVolumeFirstFrame = false;
@@ -667,7 +667,7 @@ namespace UnityEngine.Rendering.HighDefinition
                 passData.depthBuffer = builder.ReadTexture(waterGbufferData.waterDepthBuffer);
                 passData.depthPyramidBuffer = builder.ReadTexture(depthPyramidTexture);  // 场景深度（不含水面）
                 passData.lowResColorBuffer = builder.ReadTexture(lowResColorBuffer);
-                passData.absorbanceBuffer = builder.ReadTexture(absorbanceBuffer);
+                passData.transmittanceBuffer = builder.ReadTexture(transmittanceBuffer);
                 passData.lowResDepthBuffer = builder.ReadTexture(renderGraph.ImportTexture(m_WaterVolumeHistoryDepth));  // 低分辨率深度
                 // 读取折射 UV 纹理
                 passData.refractionUVBuffer = builder.ReadTexture(waterRefractionData.refractionData);
@@ -706,7 +706,7 @@ namespace UnityEngine.Rendering.HighDefinition
                     ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.compositeKernel,
                         HPWaterVolumeShaderIDs._HPWaterLowResColor, data.lowResColorBuffer);
                     ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.compositeKernel,
-                        HPWaterVolumeShaderIDs._HPWaterLowResAbsorbance, data.absorbanceBuffer);
+                        HPWaterVolumeShaderIDs._HPWaterLowResTransmittance, data.transmittanceBuffer);
                     ctx.cmd.SetComputeTextureParam(data.m_HanPiWaterVolumeCS, data.compositeKernel,
                         HPWaterVolumeShaderIDs._HPWaterLowResDepth, data.lowResDepthBuffer);
                     

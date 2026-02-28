@@ -313,14 +313,13 @@ uint featureFlags,out LightLoopOutput lightLoopOutput)
     float  dither = GenerateRandom1DOffset(posInput.positionSS, 1, GetTaaFrameInfo().z);
 #endif
     float  sceneRawDepth = 0;
-    float3 sceneWorldPos = 0;
     float3 refractedBackWorldPos = 0;
     float2 RefractWaterScreenCoord = 0;
 
 #if defined(USE_PRECOMPUTED_REFRACTION)
     // 使用预计算的折射数据（来自 HPWater.Shader）
+    // 注意：_HPWaterPrecomputedRefractDepth 现在存储的是线性深度，此处赋值仅为保持变量初始化
     sceneRawDepth = _HPWaterPrecomputedRefractDepth;
-    sceneWorldPos = _HPWaterPrecomputedRefractWorldPos;
     refractedBackWorldPos = _HPWaterPrecomputedRefractWorldPos;
     RefractWaterScreenCoord = _HPWaterPrecomputedRefractUV;
 #else
@@ -331,8 +330,7 @@ uint featureFlags,out LightLoopOutput lightLoopOutput)
         int2 mipOffset = _DepthPyramidMipLevelOffsets[int(0)];
         sceneRawDepth =  LOAD_TEXTURE2D_X(_CameraDepthTexture, mipOffset + mipCoord).r;
     #endif    
-    sceneWorldPos = ScreenToWorldPosition(posInput.positionNDC.xy, sceneRawDepth) - _WorldSpaceCameraPos.xyz;
-    refractedBackWorldPos = sceneWorldPos;
+    refractedBackWorldPos = ScreenToWorldPosition(posInput.positionNDC.xy, sceneRawDepth) - _WorldSpaceCameraPos.xyz;
     RefractWaterScreenCoord = posInput.positionNDC.xy;
     waterLightLoopData.ForwardScatterOffset = 0;
     waterLightLoopData.DispersionDate = 0;
@@ -340,7 +338,7 @@ uint featureFlags,out LightLoopOutput lightLoopOutput)
 
     float3 startWorldPos = posInput.positionWS;
     float3 startWorldPosNoMatOffset = 0;
-    float rayLength = length(sceneWorldPos - startWorldPos);
+    float rayLength = length(refractedBackWorldPos - startWorldPos);
            
     waterLightLoopData.RelativeStartPos = startWorldPos;    
     waterLightLoopData.RelativeStartPosNoMatOffset = startWorldPosNoMatOffset;
@@ -351,18 +349,28 @@ uint featureFlags,out LightLoopOutput lightLoopOutput)
     
     float3 rayDirection = (refractedBackWorldPos - startWorldPos);
 
-    //NoLinearScaleFactor  waterDepth < D_max : result = waterDepth, waterDepth >= D_max : result = waterDepth->0,非线性变换
-    float NoLinearScaleFactor = min(rayLength, _MaxCrossDistance) / (rayLength + 1e-8);    
+    waterLightLoopData.LinearRayDirection = rayDirection;
+    waterLightLoopData.AbsorptionCoefficient = bsdfData.absorptionColor;
+    waterLightLoopData.ScatterCoefficient = bsdfData.scatterColor;
+
+    // Beer-Lambert: 光强降至 25% 时的距离，用于 NoLinearDynamicRayDirection
+    float extinctionStrength = Luminance(bsdfData.absorptionColor + bsdfData.scatterColor);
+    float distanceTo5Percent = -log(0.25) / max(extinctionStrength, 1e-6);
+    float effectiveMaxDistance = clamp(distanceTo5Percent, 0.1, _MaxCrossDistance);
+
+    //NoLinearScaleFactor  waterDepth < D_max : result = waterDepth, waterDepth >= D_max : result = waterDepth->0,非线性变换（原逻辑用 _MaxCrossDistance）
+    float NoLinearScaleFactor = min(rayLength, _MaxCrossDistance) / (rayLength + 1e-6);
     waterLightLoopData.NoLinearRayDirection = rayDirection * NoLinearScaleFactor;
     waterLightLoopData.NoLinearRayLength = rayLength * NoLinearScaleFactor;
 
+    // NoLinearDynamicRayDirection：线性射线方向（与 LinearRayDirection 同向），距离被 effectiveMaxDistance 限制
+    float clampedDynamicLength = min(rayLength, effectiveMaxDistance);
+    waterLightLoopData.NoLinearDynamicRayDirection = safeNormalize(rayDirection) * clampedDynamicLength;
+
     //间接光穿越距离，直射光的入射穿越距离 模拟
     waterLightLoopData.NoLinearAmbientDepth = abs(safeNormalize(refractedBackWorldPos).y) * waterLightLoopData.NoLinearRayLength;
-    waterLightLoopData.NoLinearSunDepth = waterLightLoopData.NoLinearAmbientDepth * rcp(abs(safeNormalize(V).y));
-    
-    waterLightLoopData.AbsorptionCoefficient = bsdfData.absorptionColor;
-    waterLightLoopData.ScatterCoefficient = bsdfData.scatterColor;
-    
+    // 直射光穿越距离：基于视角修正。俯视(V.y≈1)时与间接光相近；平视(V.y≈0)时光线穿越水体更长，用 1/|V.y| 放大，上限 4 防止极端值
+    waterLightLoopData.NoLinearSunDepth = waterLightLoopData.NoLinearAmbientDepth * min(rcp(abs(safeNormalize(V).y)), 4);
 
     // This struct is define in the material. the Lightloop must not access it
     // PostEvaluateBSDF call at the end will convert Lighting to diffuse and specular lighting

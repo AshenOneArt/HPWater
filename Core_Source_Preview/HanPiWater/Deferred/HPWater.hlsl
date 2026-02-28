@@ -12,6 +12,7 @@ struct BSDFData
     uint diffusionProfileIndex;
     real roughness;
     real3 geomNormalWS;
+    real thickness;
     real foam;
 };
 
@@ -270,7 +271,8 @@ BSDFData ConvertSurfaceDataToBSDFData(uint2 positionSS, SurfaceData surfaceData)
 // 解码函数 (Compute Shader / Deferred Lighting 使用)
 // ============================================================================
 
-#define SACTTER_DECODE_SCALE 0.1
+#define SACTTER_DECODE_SCALE 0.01
+#define ABSORPTION_DECODE_SCALE 2
 
 // 解码 GBuffer0: normalWS + roughness
 void DecodeHPWaterGBuffer0(float4 gbuffer0, out float3 normalWS, out float roughness)
@@ -282,17 +284,18 @@ void DecodeHPWaterGBuffer0(float4 gbuffer0, out float3 normalWS, out float rough
 }
 
 // 解码 GBuffer1: scatterColor (R8G8B8A8_UNorm)
-void DecodeHPWaterGBuffer1(float4 gbuffer1, out float3 scatterColor)
+void DecodeHPWaterGBuffer1(float4 gbuffer1, out float3 scatterColor, out float thickness)
 {
     // R8G8B8A8_UNorm 格式，读取SRGB空间值
     scatterColor = gbuffer1.rgb * SACTTER_DECODE_SCALE;
+    thickness = FastSRGBToLinear(gbuffer1.a);
 }
 
 // 解码 GBuffer2: absorptionColor + foam
 void DecodeHPWaterGBuffer2(float4 gbuffer2, out float3 absorptionColor, out float foam)
 {
     // -log(x) 解码，防止 log(0)
-    absorptionColor = gbuffer2.rgb;
+    absorptionColor = gbuffer2.rgb * ABSORPTION_DECODE_SCALE;
     foam = gbuffer2.a;
 }
 
@@ -308,7 +311,7 @@ BSDFData DecodeHPWaterGBuffer(
     DecodeHPWaterGBuffer0(gbuffer0, bsdfData.normalWS, bsdfData.roughness);
     
     // 解码 GBuffer1: scatterColor
-    DecodeHPWaterGBuffer1(gbuffer1, bsdfData.scatterColor);
+    DecodeHPWaterGBuffer1(gbuffer1, bsdfData.scatterColor, bsdfData.thickness);
     
     // 解码 GBuffer2: absorptionColor + foam
     DecodeHPWaterGBuffer2(gbuffer2, bsdfData.absorptionColor, bsdfData.foam);
@@ -337,7 +340,7 @@ BSDFData DecodeHPWaterBSDFDataFromGBuffer(
     
     // 解码所有数据
     DecodeHPWaterGBuffer0(gb0, data.normalWS, data.roughness);
-    DecodeHPWaterGBuffer1(gb1, data.scatterColor);
+    DecodeHPWaterGBuffer1(gb1, data.scatterColor, data.thickness);
     DecodeHPWaterGBuffer2(gb2, data.absorptionColor, data.foam);
     
     return data;
@@ -363,7 +366,7 @@ BSDFData DecodeHPWaterBSDFDataFromGBuffer_Bilinear(
     
     // 解码所有数据
     DecodeHPWaterGBuffer0(gb0, data.normalWS, data.roughness);
-    DecodeHPWaterGBuffer1(gb1, data.scatterColor);
+    DecodeHPWaterGBuffer1(gb1, data.scatterColor, data.thickness);
     DecodeHPWaterGBuffer2(gb2, data.absorptionColor, data.foam);
     
     return data;
