@@ -2,7 +2,7 @@
 <h1 align="center">🌊 HPWater Wiki</h1>
 
 <p align="center">
-  <img width="250" alt="image" src="https://github.com/user-attachments/assets/5fc59cbf-b677-48df-acce-34e4b25832e0" />
+  <img width="250" src="https://github.com/user-attachments/assets/5fc59cbf-b677-48df-acce-34e4b25832e0" />
 </p>
 <p align="center">
   <a href="https://github.com/AshenOneArt/HPWater/wiki/HPWater-BSDF"><b>📖 HPWater BSDF 散射光照模型</b></a> •
