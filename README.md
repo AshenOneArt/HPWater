@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/AshenOneArt/HPWater/wiki/HPWater-BSDF"><b>📖 HPWater BSDF 散射光照模型</b></a>
+  <a href="https://github.com/AshenOneArt/HPWater/wiki/HPWater BSDF Wiki"><b>📖 HPWater BSDF 散射光照模型</b></a>
 </p>
 
 ---
