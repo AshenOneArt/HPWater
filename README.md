@@ -1,31 +1,27 @@
 
 <h1 align="center">🌊 HPWater Wiki</h1>
 
-
 <p align="center">
-  <a href="https://github.com/AshenOneArt/HPWater/wiki/HPWater-BSDF"><b>📖 HP WaterBSDF 散射光照模型</b></a> •
+  <a href="https://github.com/AshenOneArt/HPWater/wiki/HPWater-BSDF"><b>📖 HPWater BSDF 散射光照模型</b></a> •
 </p>
 
----
-
-### Controls (Demo) / 操作指南
-The demo scene features an **Advanced Camera Controller**.
-Demo 场景内置了 **相机控制器**，操作方式如下：
-
-| Key / 按键 | Function / 功能 |
-| :--- | :--- |
-| **W / S / A / D** | Move Camera<br>前后左右移动 |
-| **Q / E** | Move Up / Down<br>垂直升降 |
-| **Shift** | **Sprint / Boost**<br>**加速移动** |
-| **Scroll Wheel** | Fast Zoom<br>滚轮快速移动 |
-| **Tab** | Unlock Cursor<br>切换鼠标模式 |
-| **Right Mouse** | **Rotate View**<br>**按住右键 旋转视角** |
-| **Left Mouse** | **Interactive Waves**<br>**按住左键 拖动交互** |
 ---
 # HPWater
 
 **HP Water Rendering System for Unity HDRP**
 *(基于 Unity HDRP 的HP水体渲染系统)*
+
+### 🎮 Controls (Demo) / 操作指南
+
+The demo scene features an **Advanced Camera Controller**. 
+Demo 场景内置了 **相机控制器**，操作方式如下：
+
+* <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> ── Move Camera / 前后左右移动
+* <kbd>Q</kbd> / <kbd>E</kbd> ── Move Up & Down / 垂直升降
+* <kbd>Shift</kbd> ── **Sprint (Boost)** / **加速移动**
+* <kbd>Tab</kbd> ── Unlock Cursor / 切换鼠标模式
+* <kbd>🖱️ Left Click</kbd> ── **Interactive Waves** / **按住左键 拖动交互**
+---
 
 ## 🇬🇧 English
 
