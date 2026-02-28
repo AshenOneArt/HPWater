@@ -1,3 +1,13 @@
+
+<h1 align="center">🌊 HPWater Wiki</h1>
+
+
+<p align="center">
+  <a href="https://github.com/AshenOneArt/HPWater/wiki/HPWater-BSDF"><b>📖 HP WaterBSDF 散射光照模型</b></a> •
+</p>
+
+---
+
 ### Controls (Demo) / 操作指南
 The demo scene features an **Advanced Camera Controller**.
 Demo 场景内置了 **相机控制器**，操作方式如下：
